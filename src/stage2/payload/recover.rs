@@ -373,8 +373,29 @@ impl Scan {
                     _ => None,
                 })
             };
-            let (token_field, token) = literal("-1.2.1.1-")?;
-            let (input_field, input) = literal("-1.3.1.1-")?;
+            // Build 2026-10-29+: marker plaintext mat — fallback theo shape (ground truth Render:
+            // token 146-187 chars, input 538-660 chars, deu base64url).
+            let b64_literal = |lo: usize, hi: usize| {
+                fields.iter().find_map(|write| match &write.value {
+                    Written::Expression(Expression::Literal {
+                        value: JsValue::String(text),
+                    }) if text.len() >= lo
+                        && text.len() <= hi
+                        && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
+                    {
+                        Some((write.key.clone(), text.clone()))
+                    }
+                    _ => None,
+                })
+            };
+            let (token_field, token) = match literal("-1.2.1.1-") {
+                Some(found) => found,
+                None => b64_literal(120, 260)?,
+            };
+            let (input_field, input) = match literal("-1.3.1.1-") {
+                Some(found) => found,
+                None => b64_literal(400, 900)?,
+            };
             let started = fields
                 .iter()
                 .find(|write| matches!(write.value, Written::Now))?;

@@ -104,9 +104,24 @@ pub(super) fn discover(index: &Index<'_>, pool: &str) -> Result<ProbeDiscovery> 
         let index_one = position + 1;
         let created = &graph[phases[0]].code;
         let values = descriptors(listing, strings, created, *dispatcher.start(), pool)?;
+        if std::env::var_os("CF_DEBUG").is_some() {
+            eprintln!("[CF_DEBUG] probe {index_one} states={phases:?} pool_len={}", pool.len());
+            for (vi, vt) in values.iter().enumerate() {
+                eprintln!("  [{vi}] {}", &vt[..vt.len().min(800)]);
+            }
+        }
         let token = values
             .iter()
             .find(|text| text.contains("-1.2.1.1-"))
+            // Build 2026-10-29 (c787ce48cf6b+): token la blob base64url duy nhat khong phai JSON
+            // (ground truth: tlwi7 runtime 146-187 chars, cung lop voi descriptor tinh 179).
+            .or_else(|| {
+                values.iter().find(|text| {
+                    text.len() > 100
+                        && !text.starts_with('"')
+                        && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                })
+            })
             .context("probe has no token")?;
         let input: JsValue = values
             .iter()
