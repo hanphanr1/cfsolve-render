@@ -39,108 +39,81 @@ struct QueuedToken {
     minted: Instant,
 }
 
-struct Prefetch {
+// ---------- multi-target prefetch ----------
+// PREFETCH_TARGETS = JSON [{"sitekey":"0x..","url":"https://..","n":12}, ...]
+// moi muc tieu co queue rieng; /solve pop theo (sitekey, host). Fallback: env don cu
+// PREFETCH_SITEKEY/PREFETCH_URL/PREFETCH_N van hoat dong.
+
+struct Target {
     sitekey: String,
-    url_host: String,
+    url: String,
+    host: String,
     want: usize,
-    ttl: Duration,
-    max_minters: usize,
     queue: Mutex<VecDeque<QueuedToken>>,
 }
 
-fn prefetch_cfg() -> Option<&'static Prefetch> {
-    static P: LazyLock<Option<Prefetch>> = LazyLock::new(|| {
-        let sitekey = std::env::var("PREFETCH_SITEKEY").ok()?;
-        let url = std::env::var("PREFETCH_URL").ok()?;
-        let host = Url::parse(&url).ok()?.host_str()?.to_string();
-        let want: usize = std::env::var("PREFETCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-        let ttl_s: u64 = std::env::var("PREFETCH_TTL_S").ok().and_then(|v| v.parse().ok()).unwrap_or(220);
-        let max_minters: usize =
-            std::env::var("PREFETCH_MINTERS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-        if want == 0 {
-            return None;
+fn targets() -> &'static Vec<Target> {
+    static T: LazyLock<Vec<Target>> = LazyLock::new(|| {
+        let mut defs: Vec<(String, String, usize)> = Vec::new();
+        if let Ok(raw) = std::env::var("PREFETCH_TARGETS") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(arr) = v.as_array() {
+                    for item in arr {
+                        let sk = item.get("sitekey").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        let u = item.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        let n = item.get("n").and_then(|x| x.as_u64()).unwrap_or(6) as usize;
+                        if !sk.is_empty() && !u.is_empty() {
+                            defs.push((sk, u, n));
+                        }
+                    }
+                }
+            }
         }
-        Some(Prefetch {
-            sitekey,
-            url_host: host,
-            want,
-            ttl: Duration::from_secs(ttl_s),
-            max_minters,
-            queue: Mutex::new(VecDeque::new()),
-        })
+        if defs.is_empty() {
+            if let (Ok(sk), Ok(u)) = (std::env::var("PREFETCH_SITEKEY"), std::env::var("PREFETCH_URL")) {
+                if !sk.is_empty() && !u.is_empty() {
+                    let n: usize = std::env::var("PREFETCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+                    defs.push((sk, u, n));
+                }
+            }
+        }
+        defs.into_iter()
+            .filter_map(|(sitekey, url, want)| {
+                let host = Url::parse(&url).ok()?.host_str()?.to_string();
+                Some(Target { sitekey, url, host, want, queue: Mutex::new(VecDeque::new()) })
+            })
+            .collect()
     });
-    P.as_ref()
+    &T
 }
 
-fn queue_len(p: &Prefetch) -> usize {
-    p.queue.lock().map(|q| q.len()).unwrap_or(0)
+fn ttl() -> Duration {
+    Duration::from_secs(std::env::var("PREFETCH_TTL_S").ok().and_then(|v| v.parse().ok()).unwrap_or(220))
 }
 
-fn queue_ages(p: &Prefetch) -> Vec<u64> {
-    p.queue
-        .lock()
-        .map(|q| q.iter().map(|t| t.minted.elapsed().as_secs()).collect())
-        .unwrap_or_default()
+fn max_minters() -> usize {
+    std::env::var("PREFETCH_MINTERS").ok().and_then(|v| v.parse().ok()).unwrap_or(3)
 }
 
-fn pop_fresh(p: &Prefetch) -> Option<String> {
-    let mut q = p.queue.lock().ok()?;
+fn queue_len(t: &Target) -> usize {
+    t.queue.lock().map(|q| q.len()).unwrap_or(0)
+}
+
+fn queue_ages(t: &Target) -> Vec<u64> {
+    t.queue.lock().map(|q| q.iter().map(|x| x.minted.elapsed().as_secs()).collect()).unwrap_or_default()
+}
+
+fn pop_fresh(sitekey: &str, host: &str) -> Option<String> {
+    let t = targets().iter().find(|t| t.sitekey == sitekey && t.host.eq_ignore_ascii_case(host))?;
+    let mut q = t.queue.lock().ok()?;
     while let Some(front) = q.front() {
-        if front.minted.elapsed() > p.ttl {
+        if front.minted.elapsed() > ttl() {
             q.pop_front();
             continue;
         }
-        return q.pop_front().map(|t| t.token);
+        return q.pop_front().map(|x| x.token);
     }
     None
-}
-
-// ---------- external source (turntitle cloud) ----------
-// SRC_URL/SRC_TOKEN: khi CF doi build lam cfsolve local chet, queue van song bang
-// token tu turntitle (Chrome that). Local cfsolve chi la fallback khi khong co SRC.
-fn external() -> Option<&'static (String, String)> {
-    static E: LazyLock<Option<(String, String)>> = LazyLock::new(|| {
-        let url = std::env::var("SRC_URL").ok()?;
-        let token = std::env::var("SRC_TOKEN").unwrap_or_default();
-        Some((url.trim_end_matches('/').to_string(), token))
-    });
-    E.as_ref()
-}
-
-async fn mint_external(sitekey: &str, page_url: &str) -> Result<String, String> {
-    static C: LazyLock<wreq::Client> = LazyLock::new(|| {
-        wreq::Client::builder()
-            .timeout(Duration::from_secs(95))
-            .build()
-            .unwrap_or_else(|_| wreq::Client::new())
-    });
-    let (base, token) = external().ok_or("no src")?;
-    let u = format!("{base}/solve?url={page_url}&sitekey={sitekey}&timeout=80");
-    let mut req = C.get(&u).header("accept", "application/json");
-    if !token.is_empty() {
-        req = req.header("X-Token", token);
-    }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    let code = resp.status().as_u16();
-    let body = resp.text().await.map_err(|e| e.to_string())?;
-    let j: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    let tok = j.get("token").and_then(|v| v.as_str()).unwrap_or("");
-    if (200..300).contains(&code) && tok.len() >= 100 {
-        Ok(tok.to_string())
-    } else {
-        Err(format!(
-            "src {code}: {}",
-            j.get("err").and_then(|v| v.as_str()).unwrap_or("no token")
-        ))
-    }
-}
-
-async fn mint_any(sitekey: &str, page_url: &str) -> Result<String, String> {
-    if external().is_some() {
-        mint_external(sitekey, page_url).await
-    } else {
-        mint(sitekey, page_url, None).await
-    }
 }
 
 async fn mint(sitekey: &str, url: &str, proxy: Option<String>) -> Result<String, String> {
@@ -156,61 +129,67 @@ async fn mint(sitekey: &str, url: &str, proxy: Option<String>) -> Result<String,
 }
 
 fn start_minters() {
-    let Some(p) = prefetch_cfg() else { return };
+    let list = targets();
+    if list.is_empty() {
+        return;
+    }
     eprintln!(
-        "[websolve] prefetch ON: sitekey={} host={} n={} ttl={:?} minters={}",
-        p.sitekey,
-        p.url_host,
-        p.want,
-        p.ttl,
-        p.max_minters
+        "[websolve] prefetch ON: {} target(s) ttl={:?} minters={} cap={}",
+        list.len(),
+        ttl(),
+        max_minters(),
+        list.iter().map(|t| format!("{}@{}x{}", &t.sitekey[..8.min(t.sitekey.len())], t.host, t.want)).collect::<Vec<_>>().join(", ")
     );
-    for worker in 0..p.max_minters {
-        let sitekey = p.sitekey.clone();
-        let url = std::env::var("PREFETCH_URL").unwrap_or_default();
-        let url = Arc::new(url);
-        let p_ref: &'static Prefetch = p;
+    // worker pool chung: moi worker vong qua cac target thieu token ma mint
+    for worker in 0..max_minters() {
+        let list_ptr: &'static Vec<Target> = list;
         tokio::spawn(async move {
             loop {
-                // KHONG giu MutexGuard qua await (guard !Send => tokio::spawn tu choi).
-                // Tinh `need` hoan toan trong match; guard roi ngay khi match ket thuc.
-                let need = match p_ref.queue.lock() {
-                    Ok(mut q) => {
-                        // bot token qua TTL
-                        while let Some(front) = q.front() {
-                            if front.minted.elapsed() > p_ref.ttl {
-                                q.pop_front();
-                            } else {
-                                break;
+                // chon target co ty le thap nhat (queue/want)
+                let pick = {
+                    let mut best: Option<(usize, f64)> = None;
+                    for (i, t) in list_ptr.iter().enumerate() {
+                        let need = match t.queue.lock() {
+                            Ok(mut q) => {
+                                while let Some(f) = q.front() {
+                                    if f.minted.elapsed() > ttl() { q.pop_front(); } else { break; }
+                                }
+                                t.want.saturating_sub(q.len())
                             }
+                            Err(_) => 0,
+                        };
+                        if need == 0 { continue; }
+                        let ratio = need as f64 / t.want.max(1) as f64;
+                        if best.map(|(_, r)| ratio > r).unwrap_or(true) {
+                            best = Some((i, ratio));
                         }
-                        p_ref.want.saturating_sub(q.len())
                     }
-                    Err(_) => 0,
+                    best.map(|(i, _)| i)
                 };
-                if need == 0 {
+                let Some(idx) = pick else {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     continue;
-                }
-                if MINTING.load(Ordering::Relaxed) >= p_ref.max_minters {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                };
+                let t = &list_ptr[idx];
+                if MINTING.load(Ordering::Relaxed) >= max_minters() {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
                     continue;
                 }
                 MINTING.fetch_add(1, Ordering::Relaxed);
                 let started = Instant::now();
-                match mint_any(&sitekey, &url).await {
+                match mint(&t.sitekey, &t.url, None).await {
                     Ok(token) => {
                         SOLVED.fetch_add(1, Ordering::Relaxed);
-                        if let Ok(mut q) = p_ref.queue.lock() {
-                            if q.len() < p_ref.want {
+                        if let Ok(mut q) = t.queue.lock() {
+                            if q.len() < t.want {
                                 q.push_back(QueuedToken { token, minted: Instant::now() });
                             }
                         }
-                        eprintln!("[minter{worker}] OK in {:?} (queue={})", started.elapsed(), queue_len(p_ref));
+                        eprintln!("[minter{worker}] OK {} in {:?} (queue={})", &t.sitekey[..8], started.elapsed(), queue_len(t));
                     }
                     Err(e) => {
                         FAILED.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("[minter{worker}] FAIL: {e}");
+                        eprintln!("[minter{worker}] FAIL {}: {e}", &t.sitekey[..8]);
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
                 }
@@ -238,35 +217,14 @@ async fn handle_solve(body: &[u8]) -> (u16, String) {
     };
     let started = Instant::now();
     // duong nhanh: queue cho (sitekey, host) khop va khong action/cdata/proxy
-    if let Some(p) = prefetch_cfg() {
-        let host_ok = Url::parse(&req.url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.eq_ignore_ascii_case(&p.url_host)))
-            .unwrap_or(false);
-        if host_ok && req.sitekey == p.sitekey && req.action.is_none() && req.cdata.is_none() && req.proxy.is_none()
-        {
-            if let Some(token) = pop_fresh(p) {
+    if req.action.is_none() && req.cdata.is_none() && req.proxy.is_none() {
+        if let Some(host) = Url::parse(&req.url).ok().and_then(|u| u.host_str().map(|s| s.to_string())) {
+            if let Some(token) = pop_fresh(&req.sitekey, &host) {
                 return (200, format!(
                     r#"{{"success":true,"elapsed_ms":{},"from_queue":true,"token":{}}}"#,
                     started.elapsed().as_millis(),
                     serde_json::to_string(&token).unwrap_or_default()
                 ));
-            }
-        }
-    }
-    // duong thong thuong: neu co external source (turntitle) -> mint tu do cho bat ky sitekey
-    if external().is_some() {
-        match mint_external(&req.sitekey, &req.url).await {
-            Ok(token) => {
-                SOLVED.fetch_add(1, Ordering::Relaxed);
-                return (200, format!(
-                    r#"{{"success":true,"elapsed_ms":{},"from_src":"external","token":{}}}"#,
-                    started.elapsed().as_millis(),
-                    serde_json::to_string(&token).unwrap_or_default()
-                ));
-            }
-            Err(_e) => {
-                FAILED.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -314,15 +272,22 @@ fn err_json(msg: &str) -> String {
 }
 
 fn health_json() -> String {
-    let (depth, ages) = match prefetch_cfg() {
-        Some(p) => (queue_len(p), queue_ages(p)),
-        None => (0, Vec::new()),
-    };
+    let list = targets();
+    let qs: Vec<serde_json::Value> = list
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "sitekey": t.sitekey,
+                "host": t.host,
+                "want": t.want,
+                "depth": queue_len(t),
+                "ages_s": queue_ages(t),
+            })
+        })
+        .collect();
     format!(
-        r#"{{"ok":true,"mode":"{}","queue_depth":{},"queue_ages_s":{:?},"minting":{},"solved":{},"failed":{},"profile":"{}"}}"#,
-        if external().is_some() { "external" } else { "local" },
-        depth,
-        ages,
+        r#"{{"ok":true,"mode":"local","targets":{},"minting":{},"solved":{},"failed":{},"profile":"{}"}}"#,
+        serde_json::to_string(&qs).unwrap_or_default(),
         MINTING.load(Ordering::Relaxed),
         SOLVED.load(Ordering::Relaxed),
         FAILED.load(Ordering::Relaxed),
