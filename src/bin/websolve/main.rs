@@ -124,23 +124,21 @@ fn start_minters() {
         let p_ref: &'static Prefetch = p;
         tokio::spawn(async move {
             loop {
-                let need = {
-                    let mut q = match p_ref.queue.lock() {
-                        Ok(q) => q,
-                        Err(_) => {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            continue;
+                // KHONG giu MutexGuard qua await (guard !Send => tokio::spawn tu choi).
+                // Tinh `need` hoan toan trong match; guard roi ngay khi match ket thuc.
+                let need = match p_ref.queue.lock() {
+                    Ok(mut q) => {
+                        // bot token qua TTL
+                        while let Some(front) = q.front() {
+                            if front.minted.elapsed() > p_ref.ttl {
+                                q.pop_front();
+                            } else {
+                                break;
+                            }
                         }
-                    };
-                    // bot token qua TTL
-                    while let Some(front) = q.front() {
-                        if front.minted.elapsed() > p_ref.ttl {
-                            q.pop_front();
-                        } else {
-                            break;
-                        }
+                        p_ref.want.saturating_sub(q.len())
                     }
-                    p_ref.want.saturating_sub(q.len())
+                    Err(_) => 0,
                 };
                 if need == 0 {
                     tokio::time::sleep(Duration::from_millis(300)).await;
