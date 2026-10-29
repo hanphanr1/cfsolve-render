@@ -122,7 +122,8 @@ async fn mint_external(sitekey: &str, page_url: &str) -> Result<String, String> 
     }
     let resp = req.send().await.map_err(|e| e.to_string())?;
     let code = resp.status().as_u16();
-    let j: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    let j: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     let tok = j.get("token").and_then(|v| v.as_str()).unwrap_or("");
     if (200..300).contains(&code) && tok.len() >= 100 {
         Ok(tok.to_string())
@@ -264,7 +265,7 @@ async fn handle_solve(body: &[u8]) -> (u16, String) {
                     serde_json::to_string(&token).unwrap_or_default()
                 ));
             }
-            Err(e) => {
+            Err(_e) => {
                 FAILED.fetch_add(1, Ordering::Relaxed);
             }
         }
