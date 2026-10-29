@@ -95,6 +95,53 @@ fn pop_fresh(p: &Prefetch) -> Option<String> {
     None
 }
 
+// ---------- external source (turntitle cloud) ----------
+// SRC_URL/SRC_TOKEN: khi CF doi build lam cfsolve local chet, queue van song bang
+// token tu turntitle (Chrome that). Local cfsolve chi la fallback khi khong co SRC.
+fn external() -> Option<&'static (String, String)> {
+    static E: LazyLock<Option<(String, String)>> = LazyLock::new(|| {
+        let url = std::env::var("SRC_URL").ok()?;
+        let token = std::env::var("SRC_TOKEN").unwrap_or_default();
+        Some((url.trim_end_matches('/').to_string(), token))
+    });
+    E.as_ref()
+}
+
+async fn mint_external(sitekey: &str, page_url: &str) -> Result<String, String> {
+    static C: LazyLock<wreq::Client> = LazyLock::new(|| {
+        wreq::Client::builder()
+            .timeout(Duration::from_secs(95))
+            .build()
+            .unwrap_or_else(|_| wreq::Client::new())
+    });
+    let (base, token) = external().ok_or("no src")?;
+    let u = format!("{base}/solve?url={page_url}&sitekey={sitekey}&timeout=80");
+    let mut req = C.get(&u).header("accept", "application/json");
+    if !token.is_empty() {
+        req = req.header("X-Token", token);
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let code = resp.status().as_u16();
+    let j: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let tok = j.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    if (200..300).contains(&code) && tok.len() >= 100 {
+        Ok(tok.to_string())
+    } else {
+        Err(format!(
+            "src {code}: {}",
+            j.get("err").and_then(|v| v.as_str()).unwrap_or("no token")
+        ))
+    }
+}
+
+async fn mint_any(sitekey: &str, page_url: &str) -> Result<String, String> {
+    if external().is_some() {
+        mint_external(sitekey, page_url).await
+    } else {
+        mint(sitekey, page_url, None).await
+    }
+}
+
 async fn mint(sitekey: &str, url: &str, proxy: Option<String>) -> Result<String, String> {
     let b = browser().map_err(|e| e)?;
     let url = Url::parse(url).map_err(|e| e.to_string())?;
@@ -150,7 +197,7 @@ fn start_minters() {
                 }
                 MINTING.fetch_add(1, Ordering::Relaxed);
                 let started = Instant::now();
-                match mint(&sitekey, &url, None).await {
+                match mint_any(&sitekey, &url).await {
                     Ok(token) => {
                         SOLVED.fetch_add(1, Ordering::Relaxed);
                         if let Ok(mut q) = p_ref.queue.lock() {
@@ -206,7 +253,23 @@ async fn handle_solve(body: &[u8]) -> (u16, String) {
             }
         }
     }
-    // duong thong thuong: mint truc tiep
+    // duong thong thuong: neu co external source (turntitle) -> mint tu do cho bat ky sitekey
+    if external().is_some() {
+        match mint_external(&req.sitekey, &req.url).await {
+            Ok(token) => {
+                SOLVED.fetch_add(1, Ordering::Relaxed);
+                return (200, format!(
+                    r#"{{"success":true,"elapsed_ms":{},"from_src":"external","token":{}}}"#,
+                    started.elapsed().as_millis(),
+                    serde_json::to_string(&token).unwrap_or_default()
+                ));
+            }
+            Err(e) => {
+                FAILED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    // fallback: mint local bang cfsolve
     let b = match browser() {
         Ok(b) => b,
         Err(e) => return (500, err_json(&e)),
@@ -255,7 +318,8 @@ fn health_json() -> String {
         None => (0, Vec::new()),
     };
     format!(
-        r#"{{"ok":true,"queue_depth":{},"queue_ages_s":{:?},"minting":{},"solved":{},"failed":{},"profile":"{}"}}"#,
+        r#"{{"ok":true,"mode":"{}","queue_depth":{},"queue_ages_s":{:?},"minting":{},"solved":{},"failed":{},"profile":"{}"}}"#,
+        if external().is_some() { "external" } else { "local" },
         depth,
         ages,
         MINTING.load(Ordering::Relaxed),
