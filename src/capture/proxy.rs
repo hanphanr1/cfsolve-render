@@ -479,12 +479,19 @@ fn kept(
 
 /// Waits for Ctrl-C or SIGTERM so the proxy can write logs before exiting.
 async fn shutdown_requested() {
-    use tokio::signal::unix::{self, SignalKind};
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{self, SignalKind};
 
-    let mut terminate = unix::signal(SignalKind::terminate()).expect("watching for SIGTERM");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = terminate.recv() => {}
+        let mut terminate = unix::signal(SignalKind::terminate()).expect("watching for SIGTERM");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

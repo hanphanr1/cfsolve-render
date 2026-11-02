@@ -10,9 +10,10 @@ use num_bigint::BigUint;
 use serde::Serialize;
 use swc_core::ecma::ast::{
     ArrowExpr, AssignExpr, AssignTarget, BindingIdent, BlockStmt, CallExpr, Callee, ClassDecl,
-    Expr, FnDecl, Function, IfStmt, ObjectLit, Script, SimpleAssignTarget, Stmt, VarDeclarator,
+    ComputedPropName, Expr, FnDecl, Function, IfStmt, Lit, MemberExpr, MemberProp, ObjectLit,
+    Script, SimpleAssignTarget, Stmt, Str, VarDeclarator,
 };
-use swc_core::ecma::visit::{Visit, VisitWith};
+use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 use url::Url;
 
 use crate::challenge::codec::{Codec, KEY_LENGTH, SEED_LENGTH};
@@ -136,6 +137,8 @@ impl<'source> PreparedSession<'source> {
         let request = InitialRequest::from_parsed(parsed, iframe_url)?;
         let runner =
             vm::runner_name(&parsed.script).context("the script installs no program runner")?;
+        let mut constants = Constants::default();
+        parsed.script.visit_with(&mut constants);
         let mut components = Components {
             parsed,
             options: &request.options,
@@ -143,6 +146,7 @@ impl<'source> PreparedSession<'source> {
             encoders: BTreeSet::new(),
             programs: BTreeMap::new(),
             templates: Vec::new(),
+            constants,
         };
         parsed.script.visit_with(&mut components);
         let encoder = candidates::exactly_one(components.encoders, "XHR body encoder")?;
@@ -359,16 +363,120 @@ fn is_inert(statement: &Stmt) -> bool {
     }
 }
 
-fn payload_fields(template: &ObjectLit, parsed: &ParsedScript, options: &Options) -> Vec<Field> {
+/// Static string members of objects assigned to locals anywhere in the script.
+///
+/// Newer builds read a payload field through a constants object, as
+/// `namespace[constants.key]`, instead of naming the property statically.
+#[derive(Default)]
+struct Constants(std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>);
+
+impl Constants {
+    fn insert(&mut self, local: &str, key: &str, value: &str) {
+        self.0
+            .entry(local.to_owned())
+            .or_default()
+            .insert(key.to_owned(), value.to_owned());
+    }
+
+    /// Replaces a computed key that the table resolves, such as `namespace[constants.key]`, with
+    /// a computed string literal, so the property read has a static name.
+    fn resolve(&self, expression: &mut Expr) {
+        struct Resolve<'constants>(&'constants Constants);
+
+        impl VisitMut for Resolve<'_> {
+            fn visit_mut_member_expr(&mut self, member: &mut MemberExpr) {
+                member.visit_mut_children_with(self);
+                let MemberProp::Computed(computed) = &member.prop else {
+                    return;
+                };
+                let Expr::Member(key) = &*computed.expr else {
+                    return;
+                };
+                let Expr::Ident(object) = &*key.obj else {
+                    return;
+                };
+                let Some(field) = ast::member_str(&key.prop) else {
+                    return;
+                };
+                let Some(value) = self
+                    .0
+                     .0
+                    .get(&*object.sym)
+                    .and_then(|fields| fields.get(field))
+                else {
+                    return;
+                };
+                let span = computed.span;
+                member.prop = MemberProp::Computed(ComputedPropName {
+                    span,
+                    expr: Box::new(Expr::Lit(Lit::Str(Str {
+                        span,
+                        value: value.as_str().into(),
+                        raw: None,
+                    }))),
+                });
+            }
+        }
+        expression.visit_mut_with(&mut Resolve(self));
+    }
+}
+
+impl Visit for Constants {
+    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
+        match assignment.left.as_simple() {
+            Some(SimpleAssignTarget::Ident(local)) => {
+                if let Some(fields) = expression::object_fields(&assignment.right) {
+                    for field in fields {
+                        if let Some(value) = ast::static_str(field.value) {
+                            self.insert(&local.id.sym, field.key, value);
+                        }
+                    }
+                }
+            }
+            Some(SimpleAssignTarget::Member(member)) => {
+                if let Expr::Ident(object) = &*member.obj
+                    && let Some(key) = ast::member_str(&member.prop)
+                    && let Some(value) = ast::static_str(&assignment.right)
+                {
+                    self.insert(&object.sym, key, value);
+                }
+            }
+            _ => {}
+        }
+        assignment.visit_children_with(self);
+    }
+
+    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
+        if let Some(local) = declarator.name.as_ident()
+            && let Some(fields) = declarator.init.as_deref().and_then(expression::object_fields)
+        {
+            for field in fields {
+                if let Some(value) = ast::static_str(field.value) {
+                    self.insert(&local.id.sym, field.key, value);
+                }
+            }
+        }
+        declarator.visit_children_with(self);
+    }
+}
+
+fn payload_fields(
+    template: &ObjectLit,
+    parsed: &ParsedScript,
+    options: &Options,
+    constants: &Constants,
+) -> Vec<Field> {
     ast::key_values(template)
         .filter_map(|property| {
+            // Reparsing the exported expression removes outer parentheses. Remove them here
+            // too.
+            let mut expression = property.value.unwrap_parens().clone();
+            constants.resolve(&mut expression);
             Some(Field {
                 name: ast::static_key_str(&property.key)?.to_owned(),
-                // Reparsing the exported expression removes outer parentheses. Remove them here
-                // too.
-                expression: property.value.unwrap_parens().clone(),
                 text: parsed.text(&*property.value).to_owned(),
-                bootstrap_value: expression::static_value(&property.value, options),
+                bootstrap_value: expression::static_value(&expression, options),
+                expression,
             })
         })
         .collect()
@@ -449,6 +557,8 @@ struct Components<'session> {
     /// Orchestrators may repeat a program for different startup paths.
     programs: BTreeMap<String, String>,
     templates: Vec<Vec<Field>>,
+    /// Static string members of locals, used to read fields named through a constants object.
+    constants: Constants,
 }
 
 impl Visit for Components<'_> {
@@ -480,8 +590,12 @@ impl Visit for Components<'_> {
 
     fn visit_object_lit(&mut self, object: &ObjectLit) {
         if source::is_payload_template(object, self.options) {
-            self.templates
-                .push(payload_fields(object, self.parsed, self.options));
+            self.templates.push(payload_fields(
+                object,
+                self.parsed,
+                self.options,
+                &self.constants,
+            ));
         }
         object.visit_children_with(self);
     }

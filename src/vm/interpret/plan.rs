@@ -308,8 +308,9 @@ impl PlanCompiler {
             .all(|name| !self.locals.contains_key(name) && !(arrow && name == "arguments"))
     }
 
-    /// Plans a function body, binding function declarations before executing statements.
-    /// Declarations beside the VM class are planned as statements and resolved as globals.
+    /// Plans a function body or block, binding its function declarations before executing
+    /// statements, as JavaScript hoists them to the start of the body or block. Declarations
+    /// beside the VM class are planned as statements and resolved as globals.
     fn body<'a>(&mut self, statements: &'a [Stmt]) -> Vec<Statement<'a>> {
         let mut plan = Vec::with_capacity(statements.len());
         for statement in statements {
@@ -406,13 +407,13 @@ impl PlanCompiler {
                     }
                 };
                 Statement::Try {
-                    block: self.statements(&attempt.block.stmts),
+                    block: self.body(&attempt.block.stmts),
                     parameter,
-                    handler: handler.map(|handler| self.statements(&handler.body.stmts)),
+                    handler: handler.map(|handler| self.body(&handler.body.stmts)),
                     finalizer: attempt
                         .finalizer
                         .as_ref()
-                        .map(|body| self.statements(&body.stmts)),
+                        .map(|body| self.body(&body.stmts)),
                 }
             }
             Stmt::ForIn(_) | Stmt::ForOf(_) => {

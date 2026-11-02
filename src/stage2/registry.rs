@@ -166,8 +166,9 @@ families! {
         image, "image", Reference, Computed, [30];
     ParentInfo {} =>
         parent_info, "parent_info", Reference, Computed, [24];
+    // Reference 27 is the same probe in the answer profile's build, which stores its record.
     DateParsingOffsets(dates::Fields) =>
-        dates, "date_parsing_offsets", Reference, Computed, [38];
+        dates, "date_parsing_offsets", Reference, Computed, [38, 27];
     // The payload publishes the error-message length beside the record.
     ErrorMessageLength {} =>
         error_message_length, "error_message_length", Reference, Replayed, [3];

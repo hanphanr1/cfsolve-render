@@ -1,6 +1,6 @@
 //! Runs the analysis pipeline described by [`super`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use anyhow::Result;
@@ -117,6 +117,17 @@ struct ProbeArtifact<'analysis> {
 
 /// Analyzes a probe program using the VM recovered from its session script.
 pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
+    analyze_preferring(source, program, &BTreeMap::new())
+}
+
+/// Analyzes a probe program, placing every probe when `answered` names the reference probes the
+/// fingerprint has stored answers for. Answering needs a record for each probe, so probes the
+/// similarity pairing leaves over take an unused answered reference.
+pub fn analyze_preferring(
+    source: &Source,
+    program: &[u8],
+    answered: &BTreeMap<usize, Vec<String>>,
+) -> Result<Analysis> {
     // Include `cf-chl-peek` when resolving hashed comparisons. The worker-fetch probe reads
     // this header but does not store its name as a program string.
     let machine = source.machine()?;
@@ -129,7 +140,12 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
         .iter()
         .map(|probe| probe.features.as_slice())
         .collect();
-    let mut vocabulary = Vocabulary::infer(&session_features);
+    let writes: Vec<Vec<String>> = discovery
+        .probes
+        .iter()
+        .map(|probe| probe.writes.fields.clone())
+        .collect();
+    let mut vocabulary = Vocabulary::infer_preferring(&session_features, &writes, answered);
     for (position, raw) in discovery.probes.iter().enumerate() {
         if vocabulary.partner(position) == Some(AUDIT_PROBE)
             && let Some(names) = audit::names(&index, &raw.writes.fields)
@@ -137,7 +153,14 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
             vocabulary.pin(position, names);
         }
     }
-    let header: BTreeSet<String> = index.header().values().cloned().collect();
+    // Programs that decode property names inline have no header entry for them; include the
+    // names the program itself writes.
+    let header: BTreeSet<String> = index
+        .header()
+        .values()
+        .chain(index.write_keys())
+        .cloned()
+        .collect();
     let mut wrapper: BTreeSet<String> = discovery
         .probes
         .first()
@@ -165,7 +188,7 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
             entry: raw.function.pc,
             session_features: &raw.features,
             writes: &raw.writes,
-            strings: Strings::new(&features, &outputs),
+            strings: Strings::new(&features, &outputs, pool),
         })
         .or(reference.map(|reference| Operation::Replay { reference }));
         probes.push(Probe {

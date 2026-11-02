@@ -14,6 +14,11 @@ use crate::listing::Index;
 use crate::listing::fold::{self, Frame, Known, PAYLOAD_CELL};
 use crate::vm::{Constant, Effect, Term};
 
+/// Minimum length of a record's opaque token and input values. Field names run five or six
+/// characters, and short enums and sitekeys stay well below this, while record values run
+/// sixty characters and up.
+const OPAQUE_LENGTH: usize = 32;
+
 /// Additional values tracked during payload folding. Treats decoded literals as ordinary
 /// literals because only their values matter here.
 #[derive(Clone, PartialEq)]
@@ -157,7 +162,9 @@ fn resolve(term: &Term, frame: &Frame<Held>, pool: &str) -> Option<Known<Held>> 
                     })
                 }
                 _ if method(callee, Held::Json, "parse") => fold::parse(&argument)?,
-                _ => return None,
+                // Programs that read their descriptors inline decode them with `charCodeAt` and
+                // `slice` instead of calling the decoder.
+                _ => fold::string_method(callee, arguments, resolve)?,
             }
         }
         term => frame.resolve(term)?,
@@ -363,51 +370,78 @@ impl Scan {
                 objects.entry(id).or_default().push(write);
             }
         }
-        let records = objects.into_values().filter_map(|fields| {
-            // The first string literal written to the record that contains `marker`.
-            let literal = |marker: &str| {
-                fields.iter().find_map(|write| match &write.value {
-                    Written::Expression(Expression::Literal {
-                        value: JsValue::String(text),
-                    }) if text.contains(marker) => Some((write.key.clone(), text.clone())),
-                    _ => None,
-                })
-            };
-            // Build 2026-10-29+: marker plaintext mat — fallback theo shape (ground truth Render:
-            // token 146-187 chars, input 538-660 chars, deu base64url).
-            let b64_literal = |lo: usize, hi: usize| {
-                fields.iter().find_map(|write| match &write.value {
-                    Written::Expression(Expression::Literal {
-                        value: JsValue::String(text),
-                    }) if text.len() >= lo
-                        && text.len() <= hi
-                        && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
-                    {
-                        Some((write.key.clone(), text.clone()))
-                    }
-                    _ => None,
-                })
-            };
-            let (token_field, token) = match literal("-1.2.1.1-") {
-                Some(found) => found,
-                None => b64_literal(120, 260)?,
-            };
-            let (input_field, input) = match literal("-1.3.1.1-") {
-                Some(found) => found,
-                None => b64_literal(400, 900)?,
-            };
-            let started = fields
-                .iter()
-                .find(|write| matches!(write.value, Written::Now))?;
-            Some(RecordTemplate {
-                token_field,
-                token,
-                input_field,
-                input: json!(input),
-                started_field: started.key.clone(),
-            })
-        });
+        let records = objects
+            .into_values()
+            .filter_map(|fields| Self::record_template(&fields));
         candidates::exactly_one(records, "checkbox program token/input record construction")
+    }
+
+    /// The record template held by one object's fields: a start mark and two opaque string
+    /// values, the shorter being the token.
+    fn record_template(fields: &[&Write]) -> Option<RecordTemplate> {
+        let literal = |marker: &str| {
+            fields.iter().find_map(|write| match &write.value {
+                Written::Expression(Expression::Literal {
+                    value: JsValue::String(text),
+                }) if text.contains(marker) => Some((write.key.clone(), text.clone())),
+                _ => None,
+            })
+        };
+        // Build 2026-10-29+: marker plaintext mat — fallback theo shape (ground truth Render:
+        // token 146-187 chars, input 538-660 chars, deu base64url).
+        let b64_literal = |lo: usize, hi: usize| {
+            fields.iter().find_map(|write| match &write.value {
+                Written::Expression(Expression::Literal {
+                    value: JsValue::String(text),
+                }) if text.len() >= lo
+                    && text.len() <= hi
+                    && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
+                {
+                    Some((write.key.clone(), text.clone()))
+                }
+                _ => None,
+            })
+        };
+        let started = fields
+            .iter()
+            .find(|write| matches!(write.value, Written::Now))?;
+        // Newer builds drop those markers and length ranges; the record's two opaque values
+        // are then its only long strings, the shorter being the token.
+        let opaque = || {
+            let mut values: Vec<(&str, &str)> = fields
+                .iter()
+                .filter_map(|write| match &write.value {
+                    Written::Expression(Expression::Literal {
+                        value: JsValue::String(text),
+                    }) if text.len() >= OPAQUE_LENGTH => Some((write.key.as_str(), text.as_str())),
+                    _ => None,
+                })
+                .collect();
+            values.sort_by_key(|(_, text)| text.len());
+            let [(token_field, token), (input_field, input)] = values.as_slice() else {
+                return None;
+            };
+            Some((
+                (token_field.to_string(), (*token).to_owned()),
+                (input_field.to_string(), (*input).to_owned()),
+            ))
+        };
+        let (token, input) = match (literal("-1.2.1.1-"), literal("-1.3.1.1-")) {
+            (Some(token), Some(input)) => (token, input),
+            _ => match (b64_literal(120, 260), b64_literal(400, 900)) {
+                (Some(token), Some(input)) => (token, input),
+                _ => opaque()?,
+            },
+        };
+        let (token_field, token) = token;
+        let (input_field, input) = input;
+        Some(RecordTemplate {
+            token_field,
+            token,
+            input_field,
+            input: json!(input),
+            started_field: started.key.clone(),
+        })
     }
 }
 

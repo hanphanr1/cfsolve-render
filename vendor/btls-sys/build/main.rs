@@ -433,6 +433,16 @@ fn get_extra_clang_args_for_bindgen(config: &Config) -> Vec<String> {
                 }
             }
         }
+        // Native Windows builds use a mingw-w64 toolchain; libclang must be told where the
+        // target's C headers live. `MINGW_INCLUDE` lists them, separated by `;`.
+        "windows" if std::env::var_os("MINGW_INCLUDE").is_some() => {
+            let include = std::env::var("MINGW_INCLUDE").unwrap();
+            params.push("--target=x86_64-w64-mingw32".to_string());
+            for dir in include.split(';').filter(|dir| !dir.is_empty()) {
+                params.push("-isystem".to_string());
+                params.push(dir.to_string());
+            }
+        }
         _ => {}
     }
 

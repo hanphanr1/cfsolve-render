@@ -26,12 +26,13 @@ pub(super) fn recover(
     let header = index.header();
     let counter = creation
         .iter()
-        .filter_map(|pc| listing.instructions.get(pc))
-        .flat_map(|instruction| instruction.effects())
-        .find_map(|effect| match effect {
-            Effect::SetProperty { key, .. } if let Term::Reg(register) = **key => {
-                header.get(&register).cloned()
-            }
+        .filter_map(|pc| listing.instructions.get(pc).map(|instruction| (*pc, instruction)))
+        .flat_map(|(pc, instruction)| instruction.effects().map(move |effect| (pc, effect)))
+        .find_map(|(pc, effect)| match effect {
+            Effect::SetProperty { key, .. } if let Term::Reg(register) = **key => index
+                .register_string(pc, register)
+                .map(str::to_owned)
+                .or_else(|| header.get(&register).cloned()),
             _ => None,
         })
         .context("record counter field not found")?;
@@ -57,10 +58,17 @@ pub(super) fn recover(
         },
     );
     let wrapper = property_values(index, &main);
+    // Programs that decode names inline have no header entry for them; accept any property name
+    // the program itself writes.
+    let names: BTreeSet<&str> = header
+        .values()
+        .map(String::as_str)
+        .chain(index.write_keys().iter().map(String::as_str))
+        .collect();
     let wrapper_field = |what: &str, wanted: fn(&Known<Term>) -> bool| {
         wrapper
             .iter()
-            .find(|(field, value)| header.values().any(|name| name == field) && wanted(value))
+            .find(|(field, value)| names.contains(field.as_str()) && wanted(value))
             .map(|(field, _)| field.clone())
             .with_context(|| format!("record {what} field not found"))
     };

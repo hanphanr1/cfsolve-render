@@ -648,6 +648,8 @@ struct Script {
     /// Array slots containing `Reflect.construct`, indexed by array and slot.
     construct_slots: Vec<(Id, usize)>,
     applies: Vec<Id>,
+    /// Array slots containing `Reflect.apply`, indexed by array and slot.
+    apply_slots: Vec<(Id, usize)>,
     appliers: Appliers,
 }
 
@@ -816,6 +818,7 @@ impl Script {
             constructs: Vec::new(),
             construct_slots: Vec::new(),
             applies: Vec::new(),
+            apply_slots: Vec::new(),
             appliers,
         };
         program.visit_with(&mut script);
@@ -858,9 +861,13 @@ impl Script {
             .target(call)
             .ok()?;
         // Compare bindings so a nested function with the same name as a native apply
-        // alias cannot be mistaken for that alias.
-        let callee = target.callee.as_ref()?;
-        if self.function(callee).is_ok() && !self.applies.iter().any(|alias| alias == callee) {
+        // alias cannot be mistaken for that alias. Some builds keep the alias in an array slot.
+        let native = match (&target.callee, &target.slot) {
+            (Some(callee), _) => self.function(callee).is_err() || self.applies.contains(callee),
+            (None, Some(slot)) => self.apply_slots.contains(slot),
+            (None, None) => false,
+        };
+        if !native {
             return None;
         }
         let [first, second, ..] = handed(call, &target)?[..] else {
@@ -888,13 +895,16 @@ impl Visit for Script {
                 (Some(name), Some("apply")) => self.applies.push(name.to_id()),
                 _ => {}
             }
-            if method == Some("construct")
-                && let AssignTarget::Simple(SimpleAssignTarget::Member(slot)) = &assign.left
+            if let AssignTarget::Simple(SimpleAssignTarget::Member(slot)) = &assign.left
                 && let Some(array) = slot.obj.as_ident()
                 && let Some(index) = slot.prop.as_computed()
                 && let Some(index) = self.appliers.number(&index.expr).and_then(ast::array_index)
             {
-                self.construct_slots.push((array.to_id(), index));
+                match method {
+                    Some("construct") => self.construct_slots.push((array.to_id(), index)),
+                    Some("apply") => self.apply_slots.push((array.to_id(), index)),
+                    _ => {}
+                }
             }
         }
         assign.visit_children_with(self);

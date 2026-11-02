@@ -271,6 +271,13 @@ fn collection_strings(
                     if let Some(Term::Const(Constant::String(name))) = output {
                         outputs.insert(name.clone());
                     }
+                    // Programs that decode names inline write through a key register.
+                    if let Effect::SetProperty { key, .. } = effect
+                        && let Term::Reg(register) = **key
+                        && let Some(name) = index.register_string(pc, register)
+                    {
+                        outputs.insert(name.to_owned());
+                    }
                     effect.visit_terms(&mut |term| match term {
                         Term::Const(Constant::String(text)) if text.len() <= FEATURE_LENGTH => {
                             if !at_pc.contains(text) {

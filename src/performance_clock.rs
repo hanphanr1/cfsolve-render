@@ -152,6 +152,41 @@ fn murmur3_fmix64(mut value: u64) -> u64 {
     value ^ (value >> 33)
 }
 
+#[cfg(windows)]
+fn monotonic_us() -> i64 {
+    #[repr(C)]
+    struct LargeInteger {
+        low: u32,
+        high: i32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn QueryPerformanceCounter(counter: *mut LargeInteger) -> i32;
+        fn QueryPerformanceFrequency(frequency: *mut LargeInteger) -> i32;
+    }
+
+    fn value(integer: LargeInteger) -> u64 {
+        ((integer.high as u32 as u64) << 32) | integer.low as u64
+    }
+
+    static FREQUENCY: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        let mut frequency = LargeInteger { low: 0, high: 0 };
+        // SAFETY: the pointer is live and writable; the call only writes through it.
+        let status = unsafe { QueryPerformanceFrequency(&mut frequency) };
+        assert_ne!(status, 0, "the performance counter frequency is unavailable");
+        value(frequency)
+    });
+    let frequency = *FREQUENCY;
+    let mut counter = LargeInteger { low: 0, high: 0 };
+    // SAFETY: same as above. `QueryPerformanceCounter` is monotonic from boot.
+    let status = unsafe { QueryPerformanceCounter(&mut counter) };
+    assert_ne!(status, 0, "the performance counter is unavailable");
+    // The absolute reading is needed to reproduce floating-point precision loss, as on Linux.
+    (value(counter) as u128 * 1_000_000 / frequency as u128) as i64
+}
+
+#[cfg(not(windows))]
 fn monotonic_us() -> i64 {
     let mut time = libc::timespec {
         tv_sec: 0,

@@ -30,6 +30,20 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
         "userAgent",
     ];
     let strings = &probe.strings;
+    if std::env::var_os("CF_DEBUG").is_some() {
+        eprintln!(
+            "[CF_DEBUG] wn pos={} src={} stores={:?} mapped_writes={:?}",
+            probe.position,
+            strings.has("var n=self.navigator;postMessage({ "),
+            OUTPUTS.map(|name| strings.stores(name)),
+            probe
+                .writes
+                .fields
+                .iter()
+                .map(|field| probe.vocabulary.to_reference(probe.position, field))
+                .collect::<Vec<_>>(),
+        );
+    }
     if !(strings.has("var n=self.navigator;postMessage({ ") && strings.stores_all(&OUTPUTS)) {
         return None;
     }

@@ -207,7 +207,25 @@ impl<'answers> Replay<'answers> {
             )
         };
         let partner = self.vocabulary.partner(position).with_context(missing)?;
-        let stored = self.answers.probes.get(&partner).with_context(missing)?;
+        // The closest reference probe may have no stored answer while another probe of the same
+        // family does; its fields are the same, so the record still answers this probe.
+        let stored = self
+            .answers
+            .probes
+            .get(&partner)
+            .or_else(|| {
+                // A replayed probe names a reference probe; other builds of the same family
+                // store the record under their own reference number.
+                let family = probe.operation.as_ref().and_then(|operation| match operation {
+                    Operation::Replay { reference } => Kind::from_reference(*reference),
+                    operation => Some(operation.kind()),
+                });
+                family
+                    .into_iter()
+                    .flat_map(Kind::references)
+                    .find_map(|reference| self.answers.probes.get(reference))
+            })
+            .with_context(missing)?;
         let mut fields = stored.fields.clone();
         session.patch(probe, &mut fields)?;
         let mut arranged = ArrangedFields::split(fields, &stored.late);

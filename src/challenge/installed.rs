@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use anyhow::Result;
 
 use crate::js::{JsObject, JsValue, Options, Window, json};
-use crate::listing::fold::{Frame, Known};
+use crate::listing::fold::{self, Frame, Known};
 use crate::listing::query;
 use crate::script::Source;
 use crate::vm::{Effect, Exit, Listing, Term};
@@ -100,7 +100,17 @@ fn evaluate(frame: &Frame<Held>, value: &Term) -> Option<Known<Held>> {
             "window" => Known::Ext(Held::Window),
             _ => return None,
         },
-        Term::Call { arguments, .. } => {
+        // Newer programs read their compact string descriptors inline, with `charCodeAt` and
+        // `slice` arithmetic, instead of calling the program's decoder.
+        Term::Binary(operator, left, right) => {
+            fold::binary(*operator, &frame.resolve(left)?, &frame.resolve(right)?)?
+        }
+        Term::Call {
+            callee, arguments, ..
+        } => {
+            if let Some(value) = fold::string_method(callee, arguments, |term| frame.resolve(term)) {
+                return Some(value);
+            }
             let [argument] = arguments.as_slice() else {
                 return None;
             };

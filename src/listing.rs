@@ -11,4 +11,4 @@ pub(crate) mod query;
 mod strings;
 
 pub(crate) use index::Index;
-pub(crate) use strings::decode_string;
+pub(crate) use strings::{decode_string, is_descriptor};

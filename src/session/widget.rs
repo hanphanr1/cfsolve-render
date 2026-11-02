@@ -1,5 +1,7 @@
 //! Session entry points, and the widget session's shared protocol state.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use url::Url;
@@ -95,7 +97,22 @@ pub(crate) async fn native(
 ) -> Result<Outcome> {
     let landing = land(client, sink, document, navigation, page, expect).await?;
     let embedding_page = landing.embedding_page();
-    let session = start_widget(client, sink, page, embedding_page).await?;
+    // Each stored record's fields, in the order the browser wrote them: the order names the
+    // fields of probes whose inline decoding defeats string alignment.
+    let answered: BTreeMap<usize, Vec<String>> = solve
+        .answers
+        .as_ref()
+        .map(|answers| {
+            answers
+                .probes
+                .iter()
+                .map(|(reference, stored)| {
+                    (*reference, stored.fields.keys().cloned().collect())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let session = start_widget(client, sink, page, embedding_page, &answered).await?;
     let completion = session.solve(embedding_page, solve).await?;
     match landing {
         Landing::Site(_) => Ok(Outcome::Token(completion.token)),
@@ -118,7 +135,7 @@ pub(crate) async fn send_first_payload(
     expect: Expect<'_>,
 ) -> Result<()> {
     let landing = land(client, sink, document, navigation, page, expect).await?;
-    start_widget(client, sink, page, landing.embedding_page()).await?;
+    start_widget(client, sink, page, landing.embedding_page(), &BTreeMap::new()).await?;
     Ok(())
 }
 
@@ -185,6 +202,7 @@ async fn start_widget<'caller>(
     sink: &'caller dyn Sink,
     page: &Page,
     embedding_page: &EmbeddingPage,
+    answered: &BTreeMap<usize, Vec<String>>,
 ) -> Result<WidgetSession<'caller>> {
     let iframe_url = extra_params::iframe_url(&embedding_page.page, &embedding_page.script)?;
     let referrer = embedding_page
@@ -205,7 +223,7 @@ async fn start_widget<'caller>(
         encoder: &encoder,
     };
     let returned = channel.post(body, Stage::Initial).await?;
-    let analysis = analyze_probes(sink, &fetched.source, &returned.program)?;
+    let analysis = analyze_probes(sink, &fetched.source, &returned.program, answered)?;
     Ok(WidgetSession {
         client,
         sink,
@@ -221,9 +239,14 @@ async fn start_widget<'caller>(
 }
 
 /// Analyzes the probes in the first response's `program`.
-fn analyze_probes(sink: &dyn Sink, source: &Source, program: &[u8]) -> Result<Analysis> {
-    let analysis =
-        analysis::analyze(source, program).context("analyzing the first response's program")?;
+fn analyze_probes(
+    sink: &dyn Sink,
+    source: &Source,
+    program: &[u8],
+    answered: &BTreeMap<usize, Vec<String>>,
+) -> Result<Analysis> {
+    let analysis = analysis::analyze_preferring(source, program, answered)
+        .context("analyzing the first response's program")?;
     sink.json("stage2.json", &analysis.artifact())?;
     let probes = analysis.plan().probes();
     let implemented = probes

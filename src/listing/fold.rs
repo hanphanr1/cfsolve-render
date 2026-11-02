@@ -107,6 +107,14 @@ impl<X: Clone> Frame<X> {
             Term::Const(Constant::Number(number)) => Some(Known::Literal(json!(number))),
             Term::Const(Constant::String(text)) => Some(Known::Literal(json!(text))),
             Term::Cell(DECODER_CELL) => Some(Known::Decoder),
+            // Programs that read their descriptors inline compute the decoded string from known
+            // values; fold that arithmetic and string access here so every reader sees it.
+            Term::Binary(operator, left, right) => {
+                binary(*operator, &self.resolve(left)?, &self.resolve(right)?)
+            }
+            Term::Call {
+                callee, arguments, ..
+            } => string_method(callee, arguments, |term| self.resolve(term)),
             _ => None,
         }
     }
@@ -175,6 +183,66 @@ impl<X: Clone + PartialEq> Facts for Frame<X> {
 pub(crate) fn decode<X>(argument: &Known<X>, pool: &str) -> Option<Known<X>> {
     let decoded = super::decode_string(argument.text()?, pool).ok()?;
     Some(Known::Decoded(json!(decoded)))
+}
+
+/// Folds a binary operator over known numbers, for the arithmetic a program inlines to read its
+/// compact string descriptors.
+#[must_use]
+pub(crate) fn binary<X>(operator: BinaryOp, left: &Known<X>, right: &Known<X>) -> Option<Known<X>> {
+    let (left, right) = (number(left)?, number(right)?);
+    let value = match operator {
+        BinaryOp::Add => left + right,
+        BinaryOp::Sub => left - right,
+        BinaryOp::Mul => left * right,
+        _ => return None,
+    };
+    Some(Known::Literal(JsValue::Number(value)))
+}
+
+/// Folds the string methods a program inlines to read its compact string descriptors:
+/// `charCodeAt` for one UTF-16 code unit, and `slice` for a range of them.
+#[must_use]
+pub(crate) fn string_method<X>(
+    callee: &Term,
+    arguments: &[Term],
+    resolve: impl Fn(&Term) -> Option<Known<X>>,
+) -> Option<Known<X>> {
+    let Term::Get(receiver, name) = callee else {
+        return None;
+    };
+    let name = resolve(name)?.text()?.to_owned();
+    let units: Vec<u16> = resolve(receiver)?.text()?.encode_utf16().collect();
+    let value = match (name.as_str(), arguments) {
+        ("charCodeAt", [index]) => {
+            let index = offset(number(&resolve(index)?)?)?;
+            JsValue::Number(f64::from(*units.get(index)?))
+        }
+        ("slice", [start, end]) => {
+            // JavaScript clamps both indexes to the string's length.
+            let start = offset(number(&resolve(start)?)?)?.min(units.len());
+            let end = offset(number(&resolve(end)?)?)?.min(units.len());
+            JsValue::String(String::from_utf16_lossy(&units[start..end.max(start)]))
+        }
+        ("slice", [start]) => {
+            let start = offset(number(&resolve(start)?)?)?.min(units.len());
+            JsValue::String(String::from_utf16_lossy(&units[start..]))
+        }
+        _ => return None,
+    };
+    Some(Known::Literal(value))
+}
+
+fn number<X>(known: &Known<X>) -> Option<f64> {
+    match known {
+        Known::Literal(JsValue::Number(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+/// Truncates a JavaScript index to a non-negative UTF-16 offset.
+fn offset(value: f64) -> Option<usize> {
+    let value = value.trunc();
+    (value >= 0.0 && value <= usize::MAX as f64).then_some(value as usize)
 }
 
 /// Parses a known JSON string and remembers whether the string came from the decoder.
