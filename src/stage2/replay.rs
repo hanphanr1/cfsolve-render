@@ -24,7 +24,7 @@ use super::reference::{
     ENVIRONMENT_AUDIT_REDUCTION, ENVIRONMENT_AUDIT_VALUES, ENVIRONMENT_REFERRER, REFERENCE,
     WORKER_NAVIGATOR_RESULT,
 };
-use super::registry::{AUDIT_PROBE, Kind, Operation, Treatment};
+use super::registry::{AUDIT_PROBE, Kind, Operation};
 use super::trace::Trace;
 use super::vocabulary::Vocabulary;
 use crate::http::ResponseMetrics;
@@ -68,6 +68,15 @@ impl Answers {
             reference: REFERENCE.digest.clone(),
             ..Self::default()
         };
+        // Both builds run the same probes, so the session's probes are a bijection onto the
+        // reference's: a probe similarity cannot place still takes an unused reference, whose
+        // record it answers.
+        let features: Vec<&[String]> = plan
+            .probes()
+            .iter()
+            .map(|probe| probe.features.as_slice())
+            .collect();
+        let assignment = Vocabulary::assign_all(&features);
         for probe in plan.probes() {
             let position = probe.position();
             let mut fields = payload
@@ -75,9 +84,6 @@ impl Answers {
                 .and_then(JsValue::as_object)
                 .with_context(|| format!("the payload has no record for probe {}", probe.index))?
                 .clone();
-            let Some(operation) = &probe.operation else {
-                continue;
-            };
             let duration = fields
                 .get(&envelope.completion.duration)
                 .and_then(JsValue::as_i64);
@@ -94,7 +100,8 @@ impl Answers {
                 .collect();
             fields.retain(|name, _| !is_envelope(name));
             let session_name = |name| vocabulary.to_session(position, name);
-            if let Operation::WorkerNavigator(worker_navigator::Fields { properties }) = operation
+            if let Some(Operation::WorkerNavigator(worker_navigator::Fields { properties })) =
+                &probe.operation
                 && let Some(values) = fields
                     .get(session_name(WORKER_NAVIGATOR_RESULT))
                     .and_then(JsValue::as_object)
@@ -105,16 +112,19 @@ impl Answers {
                     }
                 }
             }
-            if operation.kind().treatment() == Treatment::Computed {
-                continue;
-            }
+            // Every reference gets a record: a recognized probe rebuilds its own, and an
+            // unrecognized one replays whichever reference its assignment names.
             // Only paired probes have field names that can be mapped across builds.
-            let Some(partner) = vocabulary.partner(position) else {
+            let Some(partner) = vocabulary.partner(position).or(assignment[position]) else {
                 continue;
             };
             vocabulary.rewrite_to_reference(position, &mut fields);
             // Replay refreshes an audit's navigation sizes and trace by reference name.
-            if operation.family() == Kind::EnvironmentAudit {
+            if probe
+                .operation
+                .as_ref()
+                .is_some_and(|operation| operation.family() == Kind::EnvironmentAudit)
+            {
                 ensure!(
                     fields.contains_key(ENVIRONMENT_AUDIT_GROUPS)
                         && fields.contains_key(ENVIRONMENT_AUDIT_VALUES),

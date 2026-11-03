@@ -143,6 +143,23 @@ impl Vocabulary {
         }
     }
 
+    /// Assigns every session probe a distinct reference probe, ignoring the pairing threshold.
+    ///
+    /// Both builds run the same probes, so the assignment is a bijection: a probe similarity
+    /// could not place still takes an unused reference, lowest similarity included.
+    #[must_use]
+    pub fn assign_all<S: AsRef<[String]>>(session: &[S]) -> Vec<Option<usize>> {
+        let reference = &REFERENCE.probes;
+        let session_strings: Vec<Vec<String>> = session
+            .iter()
+            .map(|probe| probe.as_ref().iter().map(|text| decoded(text)).collect())
+            .collect();
+        let answered: BTreeSet<usize> = (1..=reference.len()).collect();
+        let (mut partners, _) = pair_probes(&session_strings, reference);
+        complete_pairing(&mut partners, &session_strings, reference, &answered);
+        partners
+    }
+
     /// Replaces name pairs for probe `index` with mappings recovered from its code. Removes any
     /// existing pair involving either name. Used when code analysis identifies a field more
     /// reliably than string alignment.
@@ -371,32 +388,6 @@ fn pair_probes<S: AsRef<[String]>>(
         }
     }
     (pairs, best)
-}
-
-/// Drops strings that most probes share, such as wrapper text and the decoder's tables, keeping
-/// the probe-specific strings and names sequence alignment pairs.
-fn normalized<'a>(probes: impl Iterator<Item = &'a [String]>) -> Vec<Vec<String>> {
-    let probes: Vec<&[String]> = probes.collect();
-    if probes.len() < 2 {
-        return probes.iter().map(|probe| probe.to_vec()).collect();
-    }
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for probe in &probes {
-        for text in probe.iter() {
-            *counts.entry(text.as_str()).or_default() += 1;
-        }
-    }
-    let probe_count = probes.len();
-    probes
-        .iter()
-        .map(|probe| {
-            probe
-                .iter()
-                .filter(|text| 2 * counts[text.as_str()] < probe_count)
-                .cloned()
-                .collect()
-        })
-        .collect()
 }
 
 /// Returns strings that identify a probe across builds. Excludes randomized names, encrypted log
