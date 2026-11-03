@@ -211,21 +211,19 @@ pub(in crate::stage2) fn recover_unique<'listing>(
             }
         }
     }
-    // Several written names can guard a counter-zero object; the payload template is the one
-    // with the most fields, and a tie leaves the choice undecided.
-    let widest = layouts
-        .iter()
-        .map(|(_, layout)| layout.template.fields.len() + layout.published.len())
-        .max();
-    if let Some(widest) = widest {
-        let mut widest = layouts
-            .into_iter()
-            .filter(|(_, layout)| layout.template.fields.len() + layout.published.len() == widest);
-        let first = widest.next();
-        ensure!(
-            widest.next().is_none(),
-            "ambiguous {program} payload counter"
-        );
+    // Several written names can guard a counter-zero object. The record counter is the name
+    // the program loads most: it reads and increments it on every round.
+    let loads = |counter: &String| {
+        index
+            .strings()
+            .values()
+            .filter(|text| **text == counter.as_str())
+            .count()
+    };
+    if let Some(most) = layouts.iter().map(|(counter, _)| loads(counter)).max() {
+        let mut best = layouts.into_iter().filter(|(counter, _)| loads(counter) == most);
+        let first = best.next();
+        ensure!(best.next().is_none(), "ambiguous {program} payload counter");
         layouts = first.into_iter().collect();
     }
     let Some((counter, layout)) = layouts.pop() else {
