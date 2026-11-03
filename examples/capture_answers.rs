@@ -67,7 +67,13 @@ fn main() -> Result<()> {
             let url = fs::read_to_string(directory.join("post-url.txt"))
                 .context("reading post-url.txt")?;
             let url = Url::parse(url.trim()).context("parsing the captured POST url")?;
-            decode_response(&body, ray(&url)?).context("decoding the captured POST response")?
+            // `decode_response` returns the program as base64 text, as `response.decoded.txt`
+            // holds it; the program bytes are its standard decoding.
+            let decoded = decode_response(&body, ray(&url)?)
+                .context("decoding the captured POST response")?;
+            STANDARD
+                .decode(decoded)
+                .context("decoding the program envelope")?
         }
     };
     let text = fs::read_to_string(plain).context("reading the plaintext payload")?;

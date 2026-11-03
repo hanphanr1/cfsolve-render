@@ -224,8 +224,18 @@ fn stored_answers(directory: &Path, path: Option<&Path>) -> Result<Option<Answer
     };
     let path = directory.join(path);
     let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let answers: Answers = serde_json::from_slice(&bytes)
+    let mut answers: Answers = serde_json::from_slice(&bytes)
         .with_context(|| format!("reading stored answers {}", path.display()))?;
+    // A capture may add records the tracked device never recorded; the overlay only fills gaps,
+    // so recomputing the profile never discards a record it already holds.
+    let overlay = path.with_extension("overlay.json");
+    if let Ok(bytes) = fs::read(&overlay) {
+        let extra: Answers = serde_json::from_slice(&bytes)
+            .with_context(|| format!("reading stored answers {}", overlay.display()))?;
+        for (reference, stored) in extra.probes {
+            answers.probes.entry(reference).or_insert(stored);
+        }
+    }
     answers.check()?;
     Ok(Some(answers))
 }
