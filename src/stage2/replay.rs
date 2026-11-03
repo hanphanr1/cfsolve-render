@@ -216,7 +216,23 @@ impl<'answers> Replay<'answers> {
                     .map_or("unrecognized", |operation| operation.family().as_str())
             )
         };
-        let partner = self.vocabulary.partner(position).with_context(missing)?;
+        // A recognized kind names its reference probes; a probe the assignment placed elsewhere
+        // still needs its family's record, whose fields the kind's collector reads.
+        let family = probe
+            .operation
+            .as_ref()
+            .map_or(&[][..], |operation| operation.kind().references());
+        let partner = self
+            .vocabulary
+            .partner(position)
+            .filter(|partner| family.is_empty() || family.contains(partner))
+            .or_else(|| {
+                family
+                    .iter()
+                    .copied()
+                    .find(|reference| self.answers.probes.contains_key(reference))
+            })
+            .with_context(missing)?;
         // The closest reference probe may have no stored answer while another probe of the same
         // family does; its fields are the same, so the record still answers this probe.
         let stored = self
