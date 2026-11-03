@@ -2,8 +2,8 @@
 //! layout, instance fields, and opcode handlers. [`Session::constructed`] adds the constructor
 //! fields that depend on a program.
 //!
-//! Each handler run copies mutable values; see [`super::interpret`]. Only decrypted strings
-//! ([`Session::decrypted`]) and lazily compiled plans are cached between runs.
+//! Each handler run copies mutable values; see [`super::interpret`]. Only lazily compiled plans
+//! are cached between runs, besides the decrypted strings a loaded program caches.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -17,7 +17,7 @@ use swc_core::ecma::ast::{
 };
 
 use super::extract::{self, RunMethod};
-use super::interpret::{self, Plans, Run, Spare};
+use super::interpret::{self, Branching, Frozen, Intrinsics, Plans, Run, Spare};
 use super::output::{Constant, Position, Term};
 use super::registers::Member;
 use super::value::Value;
@@ -33,6 +33,10 @@ pub(crate) struct Session<'ast> {
     /// Lazily prepared handlers and helpers, including unsupported functions.
     pub compiled: Plans<'ast>,
     pub spare: RefCell<Spare<'ast>>,
+    /// Session binding objects handler runs share instead of copying.
+    pub frozen: Frozen,
+    /// What exploration has learned about each handler's paths, by handler address.
+    pub branching: RefCell<HashMap<usize, Branching>>,
     pub bindings: HashMap<Atom, Value<'ast>>,
     /// Names interrupted setup statements may have written, with their errors. Reading them
     /// stops interpretation.
@@ -43,9 +47,9 @@ pub(crate) struct Session<'ast> {
     /// Initial register stacks created by the constructor for handler execution.
     pub initial: Vec<(u8, Value<'ast>)>,
     /// Function used to decrypt string records stored in registers.
-    pub record_decoder: Option<Atom>,
-    /// Decrypted strings cached by record position, length, and key.
-    pub decrypted: RefCell<HashMap<(u32, u32, u32), Value<'ast>>>,
+    pub record_decoder: Option<&'ast Function>,
+    /// Script functions run natively.
+    pub intrinsics: Intrinsics,
     /// The symbol the instance keeps its program under, if any.
     pub program_key: Option<Rc<()>>,
     /// Instance objects stored under the remaining symbols.
@@ -81,16 +85,22 @@ impl<'ast> Session<'ast> {
         let functions = extract::functions(&body.stmts);
         let run = extract::run_method(&functions, run)?;
         let handlers = extract::handlers(&functions, &run.dispatch)?;
+        let record_decoder =
+            extract::record_decoder(body).and_then(|name| functions.get(&name).copied());
         let mut session = Self {
             functions,
             handlers,
             entry: extract::entry(body)?,
-            record_decoder: extract::record_decoder(body),
+            record_decoder,
             ..Self::unevaluated(constructor)
         };
         (session.bindings, session.unavailable) = interpret::setup(&session, prelude, &body.stmts);
         let constructed = construct(&mut Run::method(&session), constructor);
-        (session.state, session.layout, session.initial) = state(&run, &constructed)?;
+        Recovered {
+            state: session.state,
+            layout: session.layout,
+            initial: session.initial,
+        } = state(&run, &constructed)?;
         session.symbol_fields = constructed.objects;
         session.program_key = match &constructed.programs[..] {
             [] => None,
@@ -98,6 +108,8 @@ impl<'ast> Session<'ast> {
             symbols => bail!("the VM constructor keys {} values by symbol", symbols.len()),
         };
         session.fields = concrete(constructed.fields);
+        session.intrinsics = interpret::intrinsics(&session);
+        session.frozen = Frozen::of(&session.bindings);
         Ok(session)
     }
 
@@ -107,6 +119,8 @@ impl<'ast> Session<'ast> {
             function_values: RefCell::default(),
             compiled: Default::default(),
             spare: RefCell::default(),
+            frozen: Frozen::default(),
+            branching: RefCell::default(),
             bindings: HashMap::default(),
             unavailable: HashMap::default(),
             layout: Layout::default(),
@@ -115,7 +129,7 @@ impl<'ast> Session<'ast> {
             symbol_fields: Vec::new(),
             initial: Vec::new(),
             record_decoder: None,
-            decrypted: RefCell::default(),
+            intrinsics: Intrinsics::default(),
             fields: HashMap::default(),
             constructor,
             handlers: HashMap::default(),
@@ -345,13 +359,17 @@ fn concrete<'a>(mut fields: HashMap<String, Value<'a>>) -> HashMap<String, Value
     fields
 }
 
+/// The handler state, register layout and initial register stacks [`state`] recovers.
+struct Recovered<'a> {
+    state: HashMap<String, Value<'a>>,
+    layout: Layout,
+    initial: Vec<(u8, Value<'a>)>,
+}
+
 /// Recovers state-field values and register layout. The constructor computes indices as
 /// `this.<mask> ^ <register>` with a random mask per run. Uses zero for the mask during
 /// analysis.
-fn state<'a>(
-    names: &RunMethod<'_>,
-    constructed: &Constructed<'a>,
-) -> Result<(HashMap<String, Value<'a>>, Layout, Vec<(u8, Value<'a>)>)> {
+fn state<'a>(names: &RunMethod<'_>, constructed: &Constructed<'a>) -> Result<Recovered<'a>> {
     let fields = &constructed.fields;
     let pc = constructed
         .pc
@@ -402,7 +420,11 @@ fn state<'a>(
         .map(|write| (write.register, write.value.clone()))
         .collect();
     state.extend(mask.map(|mask| (mask, Value::Number(0.0))));
-    Ok((state, layout, initial))
+    Ok(Recovered {
+        state,
+        layout,
+        initial,
+    })
 }
 
 /// Extracts the register and optional mask field from `this.<mask> ^ <register>` or a bare

@@ -21,10 +21,8 @@ use super::interpret::Way;
 use super::machine::{Loaded, Machine};
 use super::output::{Constant, Effect, Exit, Hidden, Instruction, Listing, Path, Position, Term};
 use super::value::Value;
-use super::{HashMap, convert, dataflow};
+use super::{HashMap, convert, dataflow, packed_names};
 use crate::candidates;
-use crate::js::JsValue;
-use crate::listing::fold::{Frame, Known};
 
 impl Machine<'_> {
     /// Follows entry paths, created functions, and installed exception handlers.
@@ -59,7 +57,7 @@ impl Machine<'_> {
                     Err(failure) => walk.listing.failures.push(failure),
                 }
             }
-            if !walk.retry(self, &loaded)? && !walk.drop_shortcuts() {
+            if !(walk.retry(self, &loaded)? || walk.drop_shortcuts()) {
                 break;
             }
         }
@@ -71,7 +69,7 @@ impl Machine<'_> {
         });
         listing.failures.sort_unstable_by_key(|failure| failure.pc);
         fuse_method_calls(&mut listing);
-        fold_decoded_strings(&mut listing);
+        packed_names::fold(&mut listing);
         Ok(listing)
     }
 }
@@ -390,6 +388,23 @@ pub fn catch_frame(elements: &[Term]) -> Option<Position> {
     }
 }
 
+/// Exception continuations enter without the registers known on the normal path.
+pub(super) fn exception_entries(listing: &Listing) -> BTreeSet<u32> {
+    let mut entries = BTreeSet::new();
+    for instruction in listing.instructions.values() {
+        for effect in instruction.effects() {
+            effect.visit_terms(&mut |term| {
+                if let Term::Array(frame) = term
+                    && let Some(position) = catch_frame(frame)
+                {
+                    entries.insert(position.pc);
+                }
+            });
+        }
+    }
+    entries
+}
+
 /// Rewrites method calls to the form listing readers expect. Some builds call `object[key]`
 /// directly; others load the method into a register and later call that register with `object`
 /// as receiver.
@@ -397,15 +412,11 @@ fn fuse_method_calls(listing: &mut Listing) {
     // Unrecorded entries, such as functions and hidden targets, start with no known loads.
     let functions = listing.functions.iter().map(|function| function.pc);
     let hidden = listing.hidden.iter().map(|hidden| hidden.target.pc);
-    let entries = functions.chain(hidden).map(|pc| (pc, Loads::default()));
-    let ControlFlow::Continue(incoming) = dataflow::forward(listing, entries, |_, path, loads| {
-        for effect in &path.effects {
-            update_loads(loads, effect);
-        }
-        ControlFlow::<Infallible, bool>::Continue(true)
-    });
+    let incoming = incoming_loads(listing, functions.chain(hidden));
+    // Exception continuations also start with no known loads, without erasing the normal path's.
+    let exceptional = incoming_loads(listing, exception_entries(listing));
     for (pc, instruction) in &mut listing.instructions {
-        let Some(entry) = incoming.get(pc) else {
+        let Some(entry) = incoming.get(pc).or_else(|| exceptional.get(pc)) else {
             continue;
         };
         for path in &mut instruction.paths {
@@ -418,6 +429,21 @@ fn fuse_method_calls(listing: &mut Listing) {
             }
         }
     }
+}
+
+/// The loads known on entry to each instruction reachable from `entries`.
+fn incoming_loads(
+    listing: &Listing,
+    entries: impl IntoIterator<Item = u32>,
+) -> BTreeMap<u32, Loads> {
+    let entries = entries.into_iter().map(|pc| (pc, Loads::default()));
+    let ControlFlow::Continue(incoming) = dataflow::forward(listing, entries, |_, path, loads| {
+        for effect in &path.effects {
+            update_loads(loads, effect);
+        }
+        ControlFlow::<Infallible, bool>::Continue(true)
+    });
+    incoming
 }
 
 /// Tracks registers holding `object[key]` while the object and key registers remain unchanged.
@@ -483,71 +509,5 @@ fn fuse_call(term: &mut Term, loads: &Loads) {
     {
         **callee = Term::Get(Box::new(Term::Reg(load.object)), Box::new(load.key.clone()));
         *this = None;
-    }
-}
-
-/// Replaces inline string decoding with the constants it computes.
-///
-/// Newer builds keep property names as compact descriptors and decode them in the program with
-/// `charCodeAt`, `slice`, and arithmetic instead of loading literals. Listing readers expect a
-/// decoded string to be a constant, so fold each assignment to the string it resolves to.
-fn fold_decoded_strings(listing: &mut Listing) {
-    // Unrecorded entries, such as functions and hidden targets, start with no known values.
-    let functions = listing.functions.iter().map(|function| function.pc);
-    let hidden = listing.hidden.iter().map(|hidden| hidden.target.pc);
-    // The longest string is the program's string pool. Its register keeps it across functions,
-    // and probe decoders slice names out of it.
-    let pool = listing
-        .instructions
-        .values()
-        .flat_map(Instruction::effects)
-        .filter_map(|effect| match effect {
-            Effect::Set(register, Term::Const(Constant::String(text))) => Some((*register, text)),
-            _ => None,
-        })
-        .max_by_key(|(_, text)| text.encode_utf16().count());
-    let mut seed: Frame = Frame::default();
-    if let Some((register, text)) = pool {
-        seed.set(register, Some(Known::Literal(JsValue::String(text.clone()))));
-    }
-    let entries = functions.chain(hidden).map(|pc| (pc, seed.clone()));
-    let evaluate = |frame: &Frame, term: &Term| frame.resolve(term);
-    let ControlFlow::Continue(incoming) =
-        dataflow::forward(listing, entries, |pc, path, frame: &mut Frame| {
-            frame.begin();
-            frame.follow(pc, &path.effects, evaluate, |_, _| {});
-            ControlFlow::<Infallible, bool>::Continue(true)
-        });
-    for (pc, instruction) in &mut listing.instructions {
-        let Some(entry) = incoming.get(pc) else {
-            continue;
-        };
-        for path in &mut instruction.paths {
-            let mut frame = entry.clone();
-            frame.begin();
-            for effect in &mut path.effects {
-                match effect {
-                    Effect::Set(register, term) => {
-                        let known = match &*term {
-                            Term::Object(properties) if properties.is_empty() => {
-                                Some(Known::Object(*pc))
-                            }
-                            term => evaluate(&frame, term),
-                        };
-                        if let Some(Known::Literal(JsValue::String(text))) = &known
-                            && !matches!(term, Term::Const(Constant::String(_)))
-                        {
-                            *term = Term::Const(Constant::String(text.clone()));
-                        }
-                        frame.set(*register, known);
-                    }
-                    Effect::Let(temporary, term) => {
-                        let known = evaluate(&frame, term);
-                        frame.bind(*temporary, known);
-                    }
-                    _ => {}
-                }
-            }
-        }
     }
 }

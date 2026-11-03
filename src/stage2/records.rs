@@ -73,14 +73,11 @@ impl Completion {
         let marked = [&self.started, &self.finished, &self.duration];
         let write = |record: &mut JsObject, (field, value): (String, JsValue)| {
             ensure!(
-                !marked.contains(&&field) && !reserved.contains(&field.as_str()),
+                !record.contains_key(&field)
+                    && !marked.contains(&&field)
+                    && !reserved.contains(&field.as_str()),
                 "collector overwrote record field {field}"
             );
-            // A probe the session could not recognize replays a record from an assigned
-            // reference; a field it already created keeps its own value.
-            if record.contains_key(&field) {
-                return Ok(());
-            }
             record.insert(field, value);
             Ok(())
         };
@@ -131,6 +128,9 @@ pub struct Probe {
     /// browser's recorded order.
     #[serde(default)]
     pub writes: WriteOrder,
+    /// Session literals recovered from result writes that cannot be replayed unchanged.
+    #[serde(default)]
+    pub replay_literals: JsObject,
 }
 
 impl Probe {
@@ -279,12 +279,7 @@ impl ProbePlan {
                     .to_session(probe.position(), ERROR_MESSAGE_LENGTH_RESULT);
                 let length = records
                     .get(&probe.index.to_string())
-                    .and_then(|record| {
-                        // An unmapped name stays as the reference build spells it.
-                        record
-                            .get(field)
-                            .or_else(|| record.get(ERROR_MESSAGE_LENGTH_RESULT))
-                    })
+                    .and_then(|record| record.get(field))
                     .cloned()
                     .with_context(|| format!("probe {} recorded no length", probe.index))?;
                 lengths.insert(field.to_owned(), length);

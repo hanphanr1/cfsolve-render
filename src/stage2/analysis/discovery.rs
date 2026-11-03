@@ -104,29 +104,23 @@ pub(super) fn discover(index: &Index<'_>, pool: &str) -> Result<ProbeDiscovery> 
         let index_one = position + 1;
         let created = &graph[phases[0]].code;
         let values = descriptors(listing, strings, created, *dispatcher.start(), pool)?;
-        if std::env::var_os("CF_DEBUG").is_some() {
-            eprintln!("[CF_DEBUG] probe {index_one} states={phases:?} pool_len={}", pool.len());
-            for (vi, vt) in values.iter().enumerate() {
-                eprintln!("  [{vi}] {}", &vt[..vt.len().min(800)]);
-            }
-        }
+        let (input_position, input): (usize, JsValue) = values
+            .iter()
+            .enumerate()
+            .find_map(|(position, text)| {
+                serde_json::from_str(text)
+                    .ok()
+                    .map(|input| (position, input))
+            })
+            .with_context(|| format!("probe {index_one} has no input"))?;
+        // The token is the longest other descriptor: the record's opaque value, beside its
+        // field names and its JSON input. Its version markers change between builds.
         let token = values
             .iter()
-            .find(|text| text.contains("-1.2.1.1-"))
-            // Build 2026-10-29 (c787ce48cf6b+): token la blob base64url duy nhat khong phai JSON
-            // (ground truth: tlwi7 runtime 146-187 chars, cung lop voi descriptor tinh 179).
-            .or_else(|| {
-                values.iter().find(|text| {
-                    text.len() > 100
-                        && !text.starts_with('"')
-                        && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-                })
-            })
-            .context("probe has no token")?;
-        let input: JsValue = values
-            .iter()
-            .find_map(|text| serde_json::from_str(text).ok())
-            .with_context(|| format!("probe {index_one} has no input"))?;
+            .enumerate()
+            .filter_map(|(position, text)| (position != input_position).then_some(text))
+            .max_by_key(|text| text.len())
+            .with_context(|| format!("probe {index_one} has no token: {values:?}"))?;
         let body = &listing.instructions[&states[phases[1]]];
         let function = body
             .effects()
@@ -271,13 +265,6 @@ fn collection_strings(
                     if let Some(Term::Const(Constant::String(name))) = output {
                         outputs.insert(name.clone());
                     }
-                    // Programs that decode names inline write through a key register.
-                    if let Effect::SetProperty { key, .. } = effect
-                        && let Term::Reg(register) = **key
-                        && let Some(name) = index.register_string(pc, register)
-                    {
-                        outputs.insert(name.to_owned());
-                    }
                     effect.visit_terms(&mut |term| match term {
                         Term::Const(Constant::String(text)) if text.len() <= FEATURE_LENGTH => {
                             if !at_pc.contains(text) {
@@ -285,10 +272,7 @@ fn collection_strings(
                             }
                         }
                         Term::Closure { pc, .. } => pending.push(*pc),
-                        // A frame pushed for a catch handler: [pc, key, ...].
-                        Term::Array(frame) => {
-                            pending.extend(vm::catch_frame(frame).map(|handler| handler.pc));
-                        }
+                        // Exception results are recovered separately from collection paths.
                         _ => {}
                     });
                 }
@@ -300,7 +284,34 @@ fn collection_strings(
             }
         },
     );
-    (strings.into_values().flatten().collect(), outputs)
+    (
+        without_inline_descriptors(strings.into_values().flatten()),
+        outputs,
+    )
+}
+
+/// Drops string descriptors the program decodes in place, keeping the decoded text that follows
+/// each one (see `vm::packed_names`). Other builds decode descriptors where the listing cannot
+/// follow, so recognizers read those descriptors themselves.
+fn without_inline_descriptors(strings: impl Iterator<Item = String>) -> Vec<String> {
+    // An inline descriptor: a two-unit big-endian length, then at least that much text.
+    let describes = |descriptor: &str, text: &str| {
+        let units: Vec<u16> = descriptor.encode_utf16().collect();
+        let [high @ 0..=255, low @ 0..=255, rest @ ..] = units.as_slice() else {
+            return false;
+        };
+        let length = usize::from(*high) * 256 + usize::from(*low);
+        rest.get(..length)
+            .is_some_and(|described| described.iter().copied().eq(text.encode_utf16()))
+    };
+    let mut kept: Vec<String> = Vec::new();
+    for text in strings {
+        if kept.last().is_some_and(|last| describes(last, &text)) {
+            kept.pop();
+        }
+        kept.push(text);
+    }
+    kept
 }
 
 /// Writes made by a collection function, in execution order.
@@ -505,4 +516,22 @@ fn pushed_object(
         object,
         stores_before,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_inline_descriptors;
+
+    #[test]
+    fn drops_only_descriptors_followed_by_their_text() {
+        let strings = [
+            "\0\u{3}abc\0\0", // decoded in place
+            "abc",
+            "\0\u{3}xyz\0", // decoded elsewhere
+            "toString",     // reads as an oversized length
+            "String",
+        ];
+        let kept = without_inline_descriptors(strings.into_iter().map(String::from));
+        assert_eq!(kept, ["abc", "\0\u{3}xyz\0", "toString", "String"]);
+    }
 }

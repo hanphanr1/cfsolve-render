@@ -162,9 +162,7 @@ fn resolve(term: &Term, frame: &Frame<Held>, pool: &str) -> Option<Known<Held>> 
                     })
                 }
                 _ if method(callee, Held::Json, "parse") => fold::parse(&argument)?,
-                // Programs that read their descriptors inline decode them with `charCodeAt` and
-                // `slice` instead of calling the decoder.
-                _ => fold::string_method(callee, arguments, resolve)?,
+                _ => return None,
             }
         }
         term => frame.resolve(term)?,
@@ -181,9 +179,9 @@ pub(in crate::stage2) struct Recovered<'listing> {
     pub literals: Vec<RecordLiteral>,
 }
 
-/// Recovers the payload and any checkbox record. Tries the header's names and the names the
-/// program writes as record-counter candidates: builds that decode names inline load none of
-/// them into the header. Uses `program` to identify errors.
+/// Recovers the payload and any checkbox record. Tries unique header names as record-counter
+/// candidates, then, for programs whose header holds no names, the fields published objects
+/// start at zero. Uses `program` to identify errors.
 pub(in crate::stage2) fn recover_unique<'listing>(
     index: &Index<'listing>,
     program: &str,
@@ -194,38 +192,21 @@ pub(in crate::stage2) fn recover_unique<'listing>(
     let scan = scan(index, pool);
     let mut layouts = Vec::new();
     let mut failure = None;
-    let mut counters: Vec<&String> = index.header().values().collect();
-    counters.extend(index.write_keys().iter());
-    let mut seen = std::collections::BTreeSet::new();
-    for counter in counters {
-        if !seen.insert(counter.as_str()) {
-            continue;
-        }
-        match scan.layout(counter) {
-            Ok(layout) => layouts.push((counter.clone(), layout)),
-            Err(error) => {
-                if std::env::var_os("CF_DEBUG").is_some() {
-                    eprintln!("[CF_DEBUG] counter {counter:?} -> {error}");
-                }
-                failure = Some(error);
+    for candidates in [
+        index.header().values().cloned().collect(),
+        scan.zeroed_fields(),
+    ] {
+        for counter in candidates {
+            match scan.layout(&counter) {
+                Ok(layout) => layouts.push((counter, layout)),
+                Err(error) => failure = Some(error),
             }
         }
+        if !layouts.is_empty() {
+            break;
+        }
     }
-    // Several written names can guard a counter-zero object. The record counter is the name
-    // the program loads most: it reads and increments it on every round.
-    let loads = |counter: &String| {
-        index
-            .strings()
-            .values()
-            .filter(|text| **text == counter.as_str())
-            .count()
-    };
-    if let Some(most) = layouts.iter().map(|(counter, _)| loads(counter)).max() {
-        let mut best = layouts.into_iter().filter(|(counter, _)| loads(counter) == most);
-        let first = best.next();
-        ensure!(best.next().is_none(), "ambiguous {program} payload counter");
-        layouts = first.into_iter().collect();
-    }
+    ensure!(layouts.len() <= 1, "ambiguous {program} payload counter");
     let Some((counter, layout)) = layouts.pop() else {
         // Keep the last counter-candidate error to explain which required structure was
         // missing.
@@ -258,6 +239,35 @@ pub(in crate::stage2) struct RecordLiteral {
 pub(in crate::stage2) struct Scan(Vec<FunctionWrites>);
 
 impl Scan {
+    /// Fields a published object starts at zero that the program also writes to the payload as
+    /// a computed value, as it does when it increments the record counter. Other zeroed fields,
+    /// such as the probe count, are published as literals.
+    fn zeroed_fields(&self) -> Vec<String> {
+        let incremented = |field: &str| {
+            let mut payload_writes = self.0.iter().flat_map(FunctionWrites::payload_writes);
+            payload_writes.any(|write| {
+                write.key == field
+                    && !matches!(write.value, Written::Expression(Expression::Literal { .. }))
+            })
+        };
+        let mut fields: Vec<String> = Vec::new();
+        for function in &self.0 {
+            let Some(publication) = function.published else {
+                continue;
+            };
+            for write in &function.writes {
+                if write.is_zero()
+                    && write.target == WriteTarget::Object(publication.object)
+                    && !fields.contains(&write.key)
+                    && incremented(&write.key)
+                {
+                    fields.push(write.key.clone());
+                }
+            }
+        }
+        fields
+    }
+
     /// Recovers field sources for the second payload. Identifies the replacement template as the
     /// object published to the payload cell with its record `counter` initialized to zero.
     pub(in crate::stage2) fn layout(&self, counter: &str) -> Result<Layout> {
@@ -271,11 +281,9 @@ impl Scan {
                 .filter(|write| write.target == WriteTarget::Object(publication.object))
                 .collect();
             fields.len() > 20
-                && fields.iter().any(|write| {
-                    write.key == counter
-                        && matches!(&write.value, Written::Expression(Expression::Literal { value })
-                            if value.as_f64() == Some(0.0))
-                })
+                && fields
+                    .iter()
+                    .any(|write| write.key == counter && write.is_zero())
         };
         let templates = functions
             .iter()
@@ -402,70 +410,34 @@ impl Scan {
         candidates::exactly_one(records, "checkbox program token/input record construction")
     }
 
-    /// The record template held by one object's fields: a start mark and two opaque string
-    /// values, the shorter being the token.
+    /// The record template held by one object's fields, if those fields carry a start mark
+    /// and exactly two opaque string values.
     fn record_template(fields: &[&Write]) -> Option<RecordTemplate> {
-        let literal = |marker: &str| {
-            fields.iter().find_map(|write| match &write.value {
-                Written::Expression(Expression::Literal {
-                    value: JsValue::String(text),
-                }) if text.contains(marker) => Some((write.key.clone(), text.clone())),
-                _ => None,
-            })
-        };
-        // Build 2026-10-29+: marker plaintext mat — fallback theo shape (ground truth Render:
-        // token 146-187 chars, input 538-660 chars, deu base64url).
-        let b64_literal = |lo: usize, hi: usize| {
-            fields.iter().find_map(|write| match &write.value {
-                Written::Expression(Expression::Literal {
-                    value: JsValue::String(text),
-                }) if text.len() >= lo
-                    && text.len() <= hi
-                    && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
-                {
-                    Some((write.key.clone(), text.clone()))
-                }
-                _ => None,
-            })
-        };
         let started = fields
             .iter()
             .find(|write| matches!(write.value, Written::Now))?;
-        // Newer builds drop those markers and length ranges; the record's two opaque values
-        // are then its only long strings, the shorter being the token.
-        let opaque = || {
-            let mut values: Vec<(&str, &str)> = fields
-                .iter()
-                .filter_map(|write| match &write.value {
-                    Written::Expression(Expression::Literal {
-                        value: JsValue::String(text),
-                    }) if text.len() >= OPAQUE_LENGTH => Some((write.key.as_str(), text.as_str())),
-                    _ => None,
-                })
-                .collect();
-            values.sort_by_key(|(_, text)| text.len());
-            let [(token_field, token), (input_field, input)] = values.as_slice() else {
-                return None;
-            };
-            Some((
-                (token_field.to_string(), (*token).to_owned()),
-                (input_field.to_string(), (*input).to_owned()),
-            ))
+        // The record's opaque values run long; field names and enums stay short. The old
+        // `-1.2.1.1-`/`-1.3.1.1-` version markers are gone in new builds, so the token is
+        // the shorter opaque value and the input the longer one.
+        let mut opaque_values: Vec<(&str, &str)> = Vec::new();
+        for write in fields {
+            if let Written::Expression(Expression::Literal {
+                value: JsValue::String(text),
+            }) = &write.value
+                && text.len() >= OPAQUE_LENGTH
+            {
+                opaque_values.push((write.key.as_str(), text.as_str()));
+            }
+        }
+        opaque_values.sort_by_key(|(_, text)| text.len());
+        let [(token_field, token), (input_field, input)] = opaque_values.as_slice() else {
+            return None;
         };
-        let (token, input) = match (literal("-1.2.1.1-"), literal("-1.3.1.1-")) {
-            (Some(token), Some(input)) => (token, input),
-            _ => match (b64_literal(120, 260), b64_literal(400, 900)) {
-                (Some(token), Some(input)) => (token, input),
-                _ => opaque()?,
-            },
-        };
-        let (token_field, token) = token;
-        let (input_field, input) = input;
         Some(RecordTemplate {
-            token_field,
-            token,
-            input_field,
-            input: json!(input),
+            token_field: (*token_field).to_owned(),
+            token: (*token).to_owned(),
+            input_field: (*input_field).to_owned(),
+            input: json!(*input),
             started_field: started.key.clone(),
         })
     }
@@ -502,6 +474,14 @@ struct Write {
     target: WriteTarget,
     key: String,
     value: Written,
+}
+
+impl Write {
+    /// Whether the write stores a literal zero, as for the record counter in the template.
+    fn is_zero(&self) -> bool {
+        matches!(&self.value, Written::Expression(Expression::Literal { value })
+            if value.as_f64() == Some(0.0))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]

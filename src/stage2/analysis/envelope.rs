@@ -24,17 +24,26 @@ pub(super) fn recover(
 ) -> Result<Envelope> {
     let listing = index.listing();
     let header = index.header();
-    let counter = creation
-        .iter()
-        .filter_map(|pc| listing.instructions.get(pc).map(|instruction| (*pc, instruction)))
-        .flat_map(|(pc, instruction)| instruction.effects().map(move |effect| (pc, effect)))
-        .find_map(|(pc, effect)| match effect {
-            Effect::SetProperty { key, .. } if let Term::Reg(register) = **key => index
-                .register_string(pc, register)
-                .map(str::to_owned)
-                .or_else(|| header.get(&register).cloned()),
-            _ => None,
+    // The counter's key is a header register, or, in programs that unpack names where they
+    // use them, a register loaded in the creation state.
+    let keys = || {
+        let instructions = creation
+            .iter()
+            .filter_map(|pc| listing.instructions.get(pc));
+        instructions.flat_map(|instruction| {
+            instruction
+                .effects()
+                .filter_map(move |effect| match effect {
+                    Effect::SetProperty { key, .. } if let Term::Reg(register) = **key => {
+                        Some((instruction.pc, register))
+                    }
+                    _ => None,
+                })
         })
+    };
+    let counter = keys()
+        .find_map(|(_, register)| header.get(&register).cloned())
+        .or_else(|| keys().find_map(|(pc, register)| index.text(pc, &Term::Reg(register))))
         .context("record counter field not found")?;
     let written_from = |matches: &dyn Fn(&Probe, &JsValue) -> bool| {
         literals
@@ -58,18 +67,17 @@ pub(super) fn recover(
         },
     );
     let wrapper = property_values(index, &main);
-    // Programs that decode names inline have no header entry for them; accept any property name
-    // the program itself writes.
-    let names: BTreeSet<&str> = header
-        .values()
-        .map(String::as_str)
-        .chain(index.write_keys().iter().map(String::as_str))
-        .collect();
+    // Prefers header names, as for the counter.
     let wrapper_field = |what: &str, wanted: fn(&Known<Term>) -> bool| {
-        wrapper
+        let mut fields = wrapper
             .iter()
-            .find(|(field, value)| names.contains(field.as_str()) && wanted(value))
-            .map(|(field, _)| field.clone())
+            .filter(|(_, value)| wanted(value))
+            .map(|(field, _)| field);
+        fields
+            .clone()
+            .find(|field| header.values().any(|name| name == *field))
+            .or_else(|| fields.next())
+            .cloned()
             .with_context(|| format!("record {what} field not found"))
     };
     let status = wrapper_field("status", |value| {

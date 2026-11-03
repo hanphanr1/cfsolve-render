@@ -20,7 +20,6 @@ pub(crate) struct Index<'listing> {
     assignments: HashMap<u8, Vec<u32>>,
     header: BTreeMap<u8, String>,
     global: OnceCell<Option<u8>>,
-    keys: OnceCell<BTreeSet<String>>,
     pub(super) stores: OnceCell<Vec<Store>>,
 }
 
@@ -66,7 +65,6 @@ impl<'listing> Index<'listing> {
             assignments,
             header,
             global: OnceCell::new(),
-            keys: OnceCell::new(),
             stores: OnceCell::new(),
         }
     }
@@ -200,53 +198,6 @@ impl<'listing> Index<'listing> {
         let pcs = self.assignments.get(&register)?;
         let before = pcs.partition_point(|&assigned| assigned < pc);
         pcs[..before].last().copied()
-    }
-
-    /// The string `register` holds just before `pc`, from the nearest assignment to it.
-    ///
-    /// Programs that decode property names inline store the decoded name in a constant; this
-    /// resolves a key register to that name without folding the whole function again.
-    #[must_use]
-    pub(crate) fn register_string(&self, pc: u32, register: u8) -> Option<&'listing str> {
-        let assigned = self.assigning_before(pc, register)?;
-        self.listing
-            .instructions
-            .get(&assigned)?
-            .effects()
-            .find_map(|effect| match effect {
-                Effect::Set(set, Term::Const(Constant::String(text))) if *set == register => {
-                    Some(text.as_str())
-                }
-                _ => None,
-            })
-    }
-
-    /// Property names the program writes, from constant or decoded key registers.
-    ///
-    /// Programs that decode names inline store them in registers, so a write's key is not a
-    /// constant; resolve it from the nearest assignment.
-    #[must_use]
-    pub(crate) fn write_keys(&self) -> &BTreeSet<String> {
-        self.keys.get_or_init(|| {
-            let mut keys = BTreeSet::new();
-            for (&pc, instruction) in &self.listing.instructions {
-                for effect in instruction.effects() {
-                    let Effect::SetProperty { key, .. } = effect else {
-                        continue;
-                    };
-                    match &**key {
-                        Term::Const(Constant::String(text)) => {
-                            keys.insert(text.clone());
-                        }
-                        Term::Reg(register) => {
-                            keys.extend(self.register_string(pc, *register).map(str::to_owned));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            keys
-        })
     }
 
     /// Iterates all path effects in program-counter order.

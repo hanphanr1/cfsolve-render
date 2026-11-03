@@ -30,17 +30,6 @@ pub(crate) fn decode_string(descriptor: &str, pool: &str) -> Result<String> {
     String::from_utf16(&text).context("decoded string contains an unpaired surrogate")
 }
 
-/// Whether `text` is a compact string descriptor: a zero byte and a fitting length, or the
-/// pooled marker.
-#[must_use]
-pub(crate) fn is_descriptor(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    (bytes.len() >= 2
-        && bytes[0] == 0
-        && usize::from(bytes[1]) <= bytes.len().saturating_sub(2))
-        || text.starts_with('\u{ffff}')
-}
-
 fn integer(text: &[u16], offset: usize, width: usize) -> Result<usize> {
     let bytes = text
         .get(offset..offset + width)

@@ -14,48 +14,27 @@ pub(crate) struct Strings<'probe> {
     features: &'probe [String],
     outputs: &'probe BTreeSet<String>,
     present: HashSet<&'probe str>,
-    /// Names the features hold as compact descriptors rather than text.
-    decoded: HashSet<String>,
-    /// The features with descriptors replaced by the names they encode.
-    resolved: Vec<String>,
-    /// The program's string pool, which pooled descriptors index.
-    pool: &'probe str,
 }
 
 impl<'probe> Strings<'probe> {
     #[must_use]
-    pub(crate) fn new(
-        features: &'probe [String],
-        outputs: &'probe BTreeSet<String>,
-        pool: &'probe str,
-    ) -> Self {
-        let resolve = |text: &String| {
-            if listing::is_descriptor(text) {
-                listing::decode_string(text, pool).unwrap_or_else(|_| text.clone())
-            } else {
-                text.clone()
-            }
-        };
-        let resolved: Vec<String> = features.iter().map(resolve).collect();
+    pub(crate) fn new(features: &'probe [String], outputs: &'probe BTreeSet<String>) -> Self {
         Self {
-            decoded: resolved.iter().cloned().collect(),
-            pool,
-            resolved,
             features,
             outputs,
             present: features.iter().map(String::as_str).collect(),
         }
     }
 
-    /// The strings, in program order, with compact descriptors replaced by their names.
+    /// The strings, in program order.
     #[must_use]
-    pub(crate) fn features(&self) -> &[String] {
-        &self.resolved
+    pub(crate) fn features(&self) -> &'probe [String] {
+        self.features
     }
 
     #[must_use]
     pub(crate) fn has(&self, text: &str) -> bool {
-        self.present.contains(text) || self.decoded.contains(text)
+        self.present.contains(text)
     }
 
     #[must_use]
@@ -79,7 +58,7 @@ impl<'probe> Strings<'probe> {
     #[must_use]
     pub(crate) fn decoded_after(&self, text: &str) -> Option<String> {
         let pair = self.features.windows(2).find(|pair| pair[0] == text)?;
-        listing::decode_string(&pair[1], self.pool).ok()
+        listing::decode_string(&pair[1], "").ok()
     }
 
     /// Returns the first inline-decoded string starting with `prefix`.
@@ -87,7 +66,7 @@ impl<'probe> Strings<'probe> {
     pub(crate) fn decoded_starting(&self, prefix: &str) -> Option<String> {
         self.features
             .iter()
-            .filter_map(|text| listing::decode_string(text, self.pool).ok())
+            .filter_map(|text| listing::decode_string(text, "").ok())
             .find(|text| text.starts_with(prefix))
     }
 }
@@ -187,7 +166,7 @@ mod tests {
     #[test]
     fn each_recognizer_recovers_only_its_own_reference_probe() {
         let probes = &REFERENCE.probes;
-        assert_eq!(probes.len(), 38);
+        assert_eq!(probes.len(), 39);
         for kind in [
             Kind::Media,
             Kind::PrivateToken,

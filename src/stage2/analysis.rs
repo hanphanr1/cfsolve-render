@@ -18,5 +18,5 @@ mod envelope;
 mod outcome;
 pub(crate) mod recognize;
 
-pub use analyze::{Analysis, Artifact, ProbeEvidence, analyze, analyze_preferring};
+pub use analyze::{Analysis, Artifact, ProbeEvidence, analyze};
 pub use outcome::ProgramOutcome;

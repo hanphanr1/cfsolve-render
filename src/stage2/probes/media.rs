@@ -349,6 +349,15 @@ impl Fields {
     }
 
     fn read(&self, record: &JsObject, started_ms: i64) -> Result<Measurement> {
+        /// The four-entry support array, deserialized from a JSON array in field order.
+        #[derive(Deserialize)]
+        struct Support {
+            audio_support: Vec<i8>,
+            video_support: Vec<i8>,
+            audio_decoding: Option<Vec<i32>>,
+            video_decoding: Option<Vec<i32>>,
+        }
+
         let field = |name: &str| {
             record
                 .get(name)
@@ -374,12 +383,12 @@ impl Fields {
             .collect::<Result<_>>()?;
         // Read MediaSource support bits followed by decoding bits or null, for audio first and then
         // video.
-        let (audio_support, video_support, audio_decoding, video_decoding): (
-            Vec<i8>,
-            Vec<i8>,
-            Option<Vec<i32>>,
-            Option<Vec<i32>>,
-        ) = js::from_value(field(MEDIA_SUPPORT)?.clone())
+        let Support {
+            audio_support,
+            video_support,
+            audio_decoding,
+            video_decoding,
+        } = js::from_value(field(MEDIA_SUPPORT)?.clone())
             .context("the media support is not four entries")?;
         let reported = [
             (&self.audio_types, &audio_decoding),
@@ -514,15 +523,39 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Box<Fields>> {
             .iter()
             .find(|text| text.starts_with(prefix) && text.contains(codec))
     };
-    let audio = find("audio/mp4;", "mp4a.40.2")?;
-    let video = find("video/mp4;", "avc1.42E01E")?;
-    let excluded = find("audio/mp4;", "theora")?;
     let types = |list: &str| -> Vec<String> { list.split('A').map(str::to_owned).collect() };
-    Some(Box::new(Fields {
-        audio_types: types(audio),
-        video_types: types(video),
-        excluded_types: types(excluded),
-    }))
+    let joined = || {
+        Some(Box::new(Fields {
+            audio_types: types(find("audio/mp4;", "mp4a.40.2")?),
+            video_types: types(find("video/mp4;", "avc1.42E01E")?),
+            excluded_types: types(find("audio/mp4;", "theora")?),
+        }))
+    };
+    joined().or_else(|| {
+        // Builds with hex names list each type: the audio types, the video types, then the
+        // excluded types, which mix both.
+        let is_media = |text: &str| text.starts_with("audio/") || text.starts_with("video/");
+        let run: Vec<String> = decoded
+            .iter()
+            .skip_while(|text| !is_media(text))
+            .take_while(|text| is_media(text))
+            .map(|text| text.to_string())
+            .collect();
+        let leading = |list: &[String], prefix: &str| {
+            list.iter()
+                .take_while(|text| text.starts_with(prefix))
+                .count()
+        };
+        let (audio, rest) = run.split_at(leading(&run, "audio/"));
+        let (video, excluded) = rest.split_at(leading(rest, "video/"));
+        (!audio.is_empty() && !video.is_empty() && !excluded.is_empty()).then(|| {
+            Box::new(Fields {
+                audio_types: audio.to_vec(),
+                video_types: video.to_vec(),
+                excluded_types: excluded.to_vec(),
+            })
+        })
+    })
 }
 
 #[cfg(test)]

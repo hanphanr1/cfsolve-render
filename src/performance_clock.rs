@@ -177,13 +177,11 @@ fn monotonic_us() -> i64 {
         assert_ne!(status, 0, "the performance counter frequency is unavailable");
         value(frequency)
     });
-    let frequency = *FREQUENCY;
     let mut counter = LargeInteger { low: 0, high: 0 };
     // SAFETY: same as above. `QueryPerformanceCounter` is monotonic from boot.
     let status = unsafe { QueryPerformanceCounter(&mut counter) };
     assert_ne!(status, 0, "the performance counter is unavailable");
-    // The absolute reading is needed to reproduce floating-point precision loss, as on Linux.
-    (value(counter) as u128 * 1_000_000 / frequency as u128) as i64
+    (value(counter) as u128 * 1_000_000 / *FREQUENCY as u128) as i64
 }
 
 #[cfg(not(windows))]

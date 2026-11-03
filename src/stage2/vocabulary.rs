@@ -7,14 +7,13 @@
 //! Probe-local mappings override the program-wide map because one build may reuse a name where
 //! another uses separate names.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::ops::Range;
 
 use rustc_hash::FxHashMap;
 
 use super::reference::REFERENCE;
-use crate::listing::{self, is_descriptor};
 use crate::js::{JsObject, JsValue};
 
 /// Session names and the reference names they stand for.
@@ -80,60 +79,22 @@ impl Vocabulary {
     /// Infers name mappings from each probe's collection strings.
     #[must_use]
     pub fn infer<S: AsRef<[String]>>(session: &[S]) -> Self {
-        Self::infer_preferring(session, &[], &BTreeMap::new())
+        Self::between(session, &REFERENCE.probes)
     }
 
-    /// Infers names, preferring reference probes that have stored answers for the replay
-    /// fallback. A session may run more probes than the reference build names, so pairing is a
-    /// bipartite matching: probes left unmatched by similarity take an unused answered reference.
-    pub fn infer_preferring<S: AsRef<[String]>>(
-        session: &[S],
-        writes: &[Vec<String>],
-        answered: &BTreeMap<usize, Vec<String>>,
-    ) -> Self {
-        Self::between(session, &REFERENCE.probes, writes, answered)
-    }
-
-    fn between<S: AsRef<[String]>>(
-        session: &[S],
-        reference: &[Vec<String>],
-        writes: &[Vec<String>],
-        answered: &BTreeMap<usize, Vec<String>>,
-    ) -> Self {
-        // Align only probe-specific strings: wrapper text and decoder tables repeat across
-        // probes and would split the runs that pair names.
-        // Names arrive as compact descriptors in newer builds; pair and align on their decoded
-        // text so they stand where the reference build's names do.
-        let session_strings: Vec<Vec<String>> = session
-            .iter()
-            .map(|probe| probe.as_ref().iter().map(|text| decoded(text)).collect())
-            .collect();
-        let answered_indices: BTreeSet<usize> = answered.keys().copied().collect();
-        let (mut partners, candidates) = pair_probes(&session_strings, reference);
-        complete_pairing(&mut partners, &session_strings, reference, &answered_indices);
-        let reference_strings: Vec<Vec<String>> =
-            reference.iter().map(|probe| probe.to_vec()).collect();
+    fn between<S: AsRef<[String]>>(session: &[S], reference: &[Vec<String>]) -> Self {
+        let (partners, candidates) = pair_probes(session, reference);
         let mut all = Votes::new();
         let mut probes = Vec::with_capacity(session.len());
-        for (index, _) in session.iter().enumerate() {
+        for (index, strings) in session.iter().enumerate() {
             let mut votes = Votes::new();
             if let Some(partner) = partners[index] {
-                let pairs = aligned_names(&session_strings[index], &reference_strings[partner - 1]);
-                for pair in pairs {
+                for pair in aligned_names(strings.as_ref(), &reference[partner - 1]) {
                     *votes.entry(pair).or_default() += 1;
                     *all.entry(pair).or_default() += 1;
                 }
             }
-            let mut names = Names::one_to_one(&votes);
-            // A build that decodes names inline loses the gap counts alignment pairs by; the
-            // record's own field order still names them, in the order the browser wrote them.
-            if let Some(partner) = partners[index]
-                && let Some(fields) = answered.get(&partner)
-                && let Some(writes) = writes.get(index)
-            {
-                supplement(&mut names, writes, fields);
-            }
-            probes.push(names);
+            probes.push(Names::one_to_one(&votes));
         }
         Self {
             global: Names::one_to_one(&all),
@@ -141,23 +102,6 @@ impl Vocabulary {
             partners,
             candidates,
         }
-    }
-
-    /// Assigns every session probe a distinct reference probe, ignoring the pairing threshold.
-    ///
-    /// Both builds run the same probes, so the assignment is a bijection: a probe similarity
-    /// could not place still takes an unused reference, lowest similarity included.
-    #[must_use]
-    pub fn assign_all<S: AsRef<[String]>>(session: &[S]) -> Vec<Option<usize>> {
-        let reference = &REFERENCE.probes;
-        let session_strings: Vec<Vec<String>> = session
-            .iter()
-            .map(|probe| probe.as_ref().iter().map(|text| decoded(text)).collect())
-            .collect();
-        let answered: BTreeSet<usize> = (1..=reference.len()).collect();
-        let (mut partners, _) = pair_probes(&session_strings, reference);
-        complete_pairing(&mut partners, &session_strings, reference, &answered);
-        partners
     }
 
     /// Replaces name pairs for probe `index` with mappings recovered from its code. Removes any
@@ -232,12 +176,15 @@ impl Vocabulary {
     }
 }
 
-/// Renames strings and object keys using `rename`.
+/// Renames strings and object keys using `rename`, including randomized names inside longer
+/// strings, such as a list of names or a style rule's selector.
 fn rewrite<'a>(value: &mut JsValue, rename: &impl Fn(&str) -> Option<&'a String>) {
     match value {
         JsValue::String(text) => {
             if let Some(name) = rename(text) {
                 *text = name.clone();
+            } else if let Some(renamed) = rename_embedded(text, rename) {
+                *text = renamed;
             }
         }
         JsValue::Array(items) => {
@@ -248,6 +195,29 @@ fn rewrite<'a>(value: &mut JsValue, rename: &impl Fn(&str) -> Option<&'a String>
         JsValue::Object(object) => rewrite_object(object, rename),
         _ => {}
     }
+}
+
+/// Renames each randomized name `text` contains, wherever it starts. Names can adjoin other
+/// hex digits, as in `_<name><hash>_<name>`, so matches need no boundary. Returns `None` if
+/// nothing was renamed.
+fn rename_embedded<'a>(text: &str, rename: &impl Fn(&str) -> Option<&'a String>) -> Option<String> {
+    const LENGTH: usize = 25;
+    let mut renamed = String::with_capacity(text.len());
+    let mut copied = 0;
+    for (at, _) in text.match_indices('_') {
+        let candidate = text.get(at..at + LENGTH).filter(|name| is_hex_name(name));
+        if at >= copied
+            && let Some(name) = candidate.and_then(rename)
+        {
+            renamed.push_str(&text[copied..at]);
+            renamed.push_str(name);
+            copied = at + LENGTH;
+        }
+    }
+    (copied > 0).then(|| {
+        renamed.push_str(&text[copied..]);
+        renamed
+    })
 }
 
 fn rewrite_object<'a>(object: &mut JsObject, rename: &impl Fn(&str) -> Option<&'a String>) {
@@ -272,92 +242,6 @@ fn best_partners<'a>(
         }
     }
     best.into_values().map(|(pair, _)| pair).collect()
-}
-
-/// Pairs the names the record's field order establishes, for a probe whose alignment left some
-/// unmapped. Requires the same fields in the same order, allowing one build to name a field the
-/// other does not.
-fn supplement(names: &mut Names, writes: &[String], fields: &[String]) {
-    if writes.is_empty() || writes.len().abs_diff(fields.len()) > 1 {
-        return;
-    }
-    if writes
-        .iter()
-        .all(|session| names.to_reference.contains_key(session))
-    {
-        return;
-    }
-    for (session, reference) in writes.iter().zip(fields) {
-        if names.to_reference.contains_key(session) || names.to_session.contains_key(reference) {
-            continue;
-        }
-        names.pair(session.clone(), reference.clone());
-    }
-}
-
-/// Matches probes similarity could not place to unused reference probes that have stored
-/// answers. Answering needs every probe, and a session may run more probes than the reference
-/// build names, so the leftover probes take the closest answered reference.
-fn complete_pairing(
-    partners: &mut [Option<usize>],
-    session: &[Vec<String>],
-    reference: &[Vec<String>],
-    answered: &BTreeSet<usize>,
-) {
-    if answered.is_empty() {
-        return;
-    }
-    let mut used: HashSet<usize> = partners.iter().flatten().copied().collect();
-    let session_sets = distinctive(session.iter().map(Vec::as_slice));
-    let reference_sets = distinctive(reference.iter().map(Vec::as_slice));
-    for (index, partner) in partners.iter_mut().enumerate() {
-        if partner.is_some() {
-            continue;
-        }
-        let best = answered
-            .iter()
-            .filter(|reference| !used.contains(reference))
-            .filter_map(|&reference| {
-                let session_set = session_sets.get(index)?;
-                let reference_set = reference_sets.get(reference - 1)?;
-                let shared = session_set.intersection(reference_set).count();
-                let all = session_set.union(reference_set).count();
-                let similarity = if all == 0 {
-                    0.0
-                } else {
-                    shared as f64 / all as f64
-                };
-                Some((similarity, reference))
-            })
-            .max_by(|(left, left_reference), (right, right_reference)| {
-                left.total_cmp(right).then(right_reference.cmp(left_reference))
-            });
-        // A session may run more probes than the reference names; the extra probe then reuses
-        // the answered reference it resembles most.
-        let best = best.or_else(|| {
-            answered
-                .iter()
-                .filter_map(|&reference| {
-                    let session_set = session_sets.get(index)?;
-                    let reference_set = reference_sets.get(reference - 1)?;
-                    let shared = session_set.intersection(reference_set).count();
-                    let all = session_set.union(reference_set).count();
-                    let similarity = if all == 0 {
-                        0.0
-                    } else {
-                        shared as f64 / all as f64
-                    };
-                    Some((similarity, reference))
-                })
-                .max_by(|(left, left_reference), (right, right_reference)| {
-                    left.total_cmp(right).then(right_reference.cmp(left_reference))
-                })
-        });
-        if let Some((_, reference)) = best {
-            used.insert(reference);
-            *partner = Some(reference);
-        }
-    }
 }
 
 /// The lowest similarity that pairs two probes. Below it, probes share mostly common wrapper
@@ -437,15 +321,6 @@ fn distinctive<'a>(probes: impl Iterator<Item = &'a [String]>) -> Vec<HashSet<&'
     sets
 }
 
-/// The name a compact descriptor encodes, or the text itself when it is not one.
-fn decoded(text: &str) -> String {
-    if is_descriptor(text) {
-        listing::decode_string(text, "").unwrap_or_else(|_| text.to_owned())
-    } else {
-        text.to_owned()
-    }
-}
-
 /// Checks for an encrypted log message in the form `<base64>$<base64>`.
 fn is_log_message(text: &str) -> bool {
     let is_base64 = |part: &str| {
@@ -465,18 +340,8 @@ fn is_log_message(text: &str) -> bool {
 fn aligned_names<'a>(session: &'a [String], reference: &'a [String]) -> Vec<(&'a str, &'a str)> {
     // Collapse repeated API loads so duplicate reads for one call do not split runs used to
     // align neighboring output names.
-    // Compact descriptors carry no name of their own; the decoded name follows them in the
-    // session's sequence, so skip the descriptor to keep the counts comparable.
-    let mut session: Vec<&str> = session
-        .iter()
-        .map(String::as_str)
-        .filter(|text| !is_descriptor(text))
-        .collect();
-    let mut reference: Vec<&str> = reference
-        .iter()
-        .map(String::as_str)
-        .filter(|text| !is_descriptor(text))
-        .collect();
+    let mut session: Vec<&str> = session.iter().map(String::as_str).collect();
+    let mut reference: Vec<&str> = reference.iter().map(String::as_str).collect();
     session.dedup();
     reference.dedup();
     // Shared strings remain anchors even if they resemble randomized identifiers, such as
@@ -500,9 +365,7 @@ fn aligned_names<'a>(session: &'a [String], reference: &'a [String]) -> Vec<(&'a
         // Repeats of a name in a row count once, even across non-name text.
         left_names.dedup();
         right_names.dedup();
-        // One build may name a string where the other loads an API name, leaving one name
-        // unpaired; the remaining names still stand in order.
-        if left_names.len().abs_diff(right_names.len()) <= 1 {
+        if left_names.len() == right_names.len() {
             pairs.extend(left_names.into_iter().zip(right_names));
         }
         if left_texts.len() == right_texts.len() {
@@ -538,13 +401,18 @@ fn embedded_names<'a>(session: &'a str, reference: &'a str) -> Vec<(&'a str, &'a
     names
 }
 
-/// Splits a string into alternating runs of ASCII letters and digits, and other characters.
+/// Splits a string into alternating runs of name bytes (see [`is_name_byte`]) and other bytes.
 fn tokens(text: &str) -> Vec<&str> {
     text.as_bytes()
-        .chunk_by(|left, right| left.is_ascii_alphanumeric() == right.is_ascii_alphanumeric())
+        .chunk_by(|left, right| is_name_byte(*left) == is_name_byte(*right))
         // Boundaries fall only beside ASCII, never inside a UTF-8 character.
         .map(|part| std::str::from_utf8(part).expect("runs split only beside ASCII bytes"))
         .collect()
+}
+
+/// Name characters, including the `_` that starts hex names.
+fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// A run of strings the session and reference sequences share.
@@ -630,22 +498,27 @@ fn longest_run(
     best
 }
 
-/// Whether a string could be one of the program's randomized names.
+/// Whether a string could be one of the program's randomized names: four to nine letters and
+/// digits such as `XNWt6`, or a hex name (see [`is_hex_name`]).
 fn is_name(text: &str) -> bool {
-    let short = (4..=9).contains(&text.len())
-        && text.starts_with(|c: char| c.is_ascii_alphabetic())
-        && text.chars().all(|c| c.is_ascii_alphanumeric())
-        && text
-            .chars()
-            .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
-    // Newer builds name fields and states with an underscore and a long hexadecimal suffix.
-    let underscored = text.strip_prefix('_').is_some_and(|rest| {
-        rest.len() == 24
-            && rest
+    is_hex_name(text)
+        || ((4..=9).contains(&text.len())
+            && text.starts_with(|c: char| c.is_ascii_alphabetic())
+            && text.chars().all(|c| c.is_ascii_alphanumeric())
+            && text
+                .chars()
+                .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))
+}
+
+/// Whether `text` is a randomized name in the form newer builds use: `_` and 24 lowercase hex
+/// digits, such as `_2b78d2cde0fa83bfaec4edae`.
+pub(crate) fn is_hex_name(text: &str) -> bool {
+    text.strip_prefix('_').is_some_and(|hex| {
+        hex.len() == 24
+            && hex
                 .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    });
-    short || underscored
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 #[cfg(test)]
@@ -655,7 +528,36 @@ mod tests {
 
     #[test]
     fn token_boundaries_preserve_non_ascii_markup() {
-        assert_eq!(tokens("é😀Aa12-中_foo"), ["é😀", "Aa12", "-中_", "foo"]);
+        // `_` belongs to names, as in hex names.
+        assert_eq!(tokens("é😀Aa12-中_foo"), ["é😀", "Aa12", "-中", "_foo"]);
+    }
+
+    #[test]
+    fn renames_names_inside_longer_strings() {
+        let name = |digit: &str| format!("_{}", digit.repeat(24));
+        let (a, b, c, x, y) = (name("a"), name("b"), name("c"), name("1"), name("2"));
+        let rename = |name: &str| match name {
+            name if name == a => Some(&x),
+            name if name == b => Some(&y),
+            _ => None,
+        };
+        let mut value = json!({
+            "list": format!("{a}, {b}, or {c}"),
+            "rule": format!(".{a} {{ color: red; }}"),
+            "joined": format!("{a}c52d060a{b}"),
+            "whole": a.clone(),
+        });
+        rewrite(&mut value, &rename);
+        assert_eq!(
+            value,
+            json!({
+                "list": format!("{x}, {y}, or {c}"),
+                "rule": format!(".{x} {{ color: red; }}"),
+                "joined": format!("{x}c52d060a{y}"),
+                "whole": x.clone(),
+            }),
+            "names without a pair stay, and names adjoining hex digits are renamed"
+        );
     }
 
     fn strings(text: &str) -> Vec<String> {
@@ -711,6 +613,24 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// A probe that shares only three of seven stable strings with its reference still pairs,
+    /// as the devtools probe must when a program never names `document`.
+    #[test]
+    fn pairs_a_probe_below_half_similarity() {
+        let session = [
+            strings("debug stack console"),
+            strings("fetch then"),
+            strings("now floor"),
+        ];
+        let reference = [
+            strings("debug stack console document create remove append"),
+            strings("fetch then"),
+            strings("now floor"),
+        ];
+        let (pairs, _) = pair_probes(&session, &reference);
+        assert_eq!(pairs, [Some(1), Some(2), Some(3)]);
     }
 
     #[test]

@@ -503,6 +503,11 @@ mod tests {
         );
         testing::assert_contains(&output, &[], &["h(r_0);", "r_0 = i;"]);
         testing::assert_lacks(&output, &["r_0 = void 0", "["]);
+        // A `void` element runs its operand without writing the local.
+        let output =
+            transform("function f() { var r; r = [void (7 ^ k ^ (7 ^ k))]; r[0] = 1; g(r[0]); }");
+        testing::assert_contains(&output, &[], &["7 ^ k ^ (7 ^ k);", "r_0 = 1;", "g(r_0);"]);
+        testing::assert_lacks(&output, &["r_0 = void"]);
         // A creation in a loop resets the slots on every iteration.
         let output =
             transform("function f() { var r; while (g()) { r = [void 0]; h(r[0]); r[0] = 1; } }");
