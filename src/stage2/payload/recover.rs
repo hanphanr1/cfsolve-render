@@ -181,8 +181,9 @@ pub(in crate::stage2) struct Recovered<'listing> {
     pub literals: Vec<RecordLiteral>,
 }
 
-/// Recovers the payload and any checkbox record. Tries unique header names as record-counter
-/// candidates. Uses `program` to identify errors.
+/// Recovers the payload and any checkbox record. Tries the header's names and the names the
+/// program writes as record-counter candidates: builds that decode names inline load none of
+/// them into the header. Uses `program` to identify errors.
 pub(in crate::stage2) fn recover_unique<'listing>(
     index: &Index<'listing>,
     program: &str,
@@ -193,13 +194,40 @@ pub(in crate::stage2) fn recover_unique<'listing>(
     let scan = scan(index, pool);
     let mut layouts = Vec::new();
     let mut failure = None;
-    for counter in index.header().values() {
+    let mut counters: Vec<&String> = index.header().values().collect();
+    counters.extend(index.write_keys().iter());
+    let mut seen = std::collections::BTreeSet::new();
+    for counter in counters {
+        if !seen.insert(counter.as_str()) {
+            continue;
+        }
         match scan.layout(counter) {
             Ok(layout) => layouts.push((counter.clone(), layout)),
-            Err(error) => failure = Some(error),
+            Err(error) => {
+                if std::env::var_os("CF_DEBUG").is_some() {
+                    eprintln!("[CF_DEBUG] counter {counter:?} -> {error}");
+                }
+                failure = Some(error);
+            }
         }
     }
-    ensure!(layouts.len() <= 1, "ambiguous {program} payload counter");
+    // Several written names can guard a counter-zero object; the payload template is the one
+    // with the most fields, and a tie leaves the choice undecided.
+    let widest = layouts
+        .iter()
+        .map(|(_, layout)| layout.template.fields.len() + layout.published.len())
+        .max();
+    if let Some(widest) = widest {
+        let mut widest = layouts
+            .into_iter()
+            .filter(|(_, layout)| layout.template.fields.len() + layout.published.len() == widest);
+        let first = widest.next();
+        ensure!(
+            widest.next().is_none(),
+            "ambiguous {program} payload counter"
+        );
+        layouts = first.into_iter().collect();
+    }
     let Some((counter, layout)) = layouts.pop() else {
         // Keep the last counter-candidate error to explain which required structure was
         // missing.
