@@ -332,6 +332,27 @@ fn complete_pairing(
             .max_by(|(left, left_reference), (right, right_reference)| {
                 left.total_cmp(right).then(right_reference.cmp(left_reference))
             });
+        // A session may run more probes than the reference names; the extra probe then reuses
+        // the answered reference it resembles most.
+        let best = best.or_else(|| {
+            answered
+                .iter()
+                .filter_map(|&reference| {
+                    let session_set = session_sets.get(index)?;
+                    let reference_set = reference_sets.get(reference - 1)?;
+                    let shared = session_set.intersection(reference_set).count();
+                    let all = session_set.union(reference_set).count();
+                    let similarity = if all == 0 {
+                        0.0
+                    } else {
+                        shared as f64 / all as f64
+                    };
+                    Some((similarity, reference))
+                })
+                .max_by(|(left, left_reference), (right, right_reference)| {
+                    left.total_cmp(right).then(right_reference.cmp(left_reference))
+                })
+        });
         if let Some((_, reference)) = best {
             used.insert(reference);
             *partner = Some(reference);
