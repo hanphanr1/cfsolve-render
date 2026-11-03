@@ -76,7 +76,8 @@ impl Completion {
                 !record.contains_key(&field)
                     && !marked.contains(&&field)
                     && !reserved.contains(&field.as_str()),
-                "collector overwrote record field {field}"
+                "collector overwrote record field {field} (created {:?}, reserved {reserved:?})",
+                record.keys().collect::<Vec<_>>()
             );
             record.insert(field, value);
             Ok(())
