@@ -235,6 +235,9 @@ fn stored_answers(directory: &Path, path: Option<&Path>) -> Result<Option<Answer
         for (reference, stored) in extra.probes {
             answers.probes.entry(reference).or_insert(stored);
         }
+        for (position, stored) in extra.positions {
+            answers.positions.entry(position).or_insert(stored);
+        }
     }
     answers.check()?;
     Ok(Some(answers))

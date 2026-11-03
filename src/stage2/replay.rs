@@ -38,6 +38,11 @@ pub struct Answers {
     pub reference: String,
     /// Stored probe answers indexed by one-based reference probe number.
     pub probes: BTreeMap<usize, Stored>,
+    /// Stored records keyed by a probe's position in the program, for probes the reference
+    /// build does not name. Names keep the capturing build's spelling, which a session of the
+    /// same build uses unchanged.
+    #[serde(default)]
+    pub positions: BTreeMap<usize, Stored>,
     /// The worker navigator, by API property.
     pub navigator: JsObject,
 }
@@ -118,6 +123,16 @@ impl Answers {
             let Some(partner) = vocabulary.partner(position).or(assignment[position]) else {
                 continue;
             };
+            // The session's own record, keyed by position: a probe the reference build does not
+            // name replays it unchanged.
+            answers.positions.insert(
+                position,
+                Stored {
+                    duration,
+                    fields: fields.clone(),
+                    late: Vec::new(),
+                },
+            );
             vocabulary.rewrite_to_reference(position, &mut fields);
             // Replay refreshes an audit's navigation sizes and trace by reference name.
             if probe
@@ -222,6 +237,24 @@ impl<'answers> Replay<'answers> {
             .operation
             .as_ref()
             .map_or(&[][..], |operation| operation.kind().references());
+        // A probe the reference build does not name carries the record its own build wrote.
+        if let Some(stored) = self.answers.positions.get(&position)
+            && self.vocabulary.partner(position).is_none()
+        {
+            // Field names are drawn per session, so a record captured by another session keeps
+            // only its values: the probe's own write order names them here.
+            let names = &probe.writes.fields;
+            if names.len() == stored.fields.len() {
+                let fields: JsObject = stored
+                    .fields
+                    .values()
+                    .cloned()
+                    .zip(names.iter().cloned())
+                    .map(|(value, name)| (name, value))
+                    .collect();
+                return Ok(ArrangedFields::split(fields, &[]));
+            }
+        }
         let partner = self
             .vocabulary
             .partner(position)
