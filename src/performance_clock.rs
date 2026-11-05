@@ -1,6 +1,7 @@
 //! Computes `performance.now()` using browser clock rules.
 //!
-//! On Linux, Chrome reads `CLOCK_MONOTONIC` through `base::TimeTicks`. It clamps the reading
+//! On Linux, Chrome reads `CLOCK_MONOTONIC` through `base::TimeTicks`, and on Windows
+//! `QueryPerformanceCounter`. It clamps the reading
 //! and time origin to 100 µs using jitter at each interval boundary, converts both to
 //! floating-point milliseconds, and subtracts. Conversion loses precision as uptime grows,
 //! producing values such as `23.300000000745058`. Use this module for all reported readings and
@@ -152,39 +153,7 @@ fn murmur3_fmix64(mut value: u64) -> u64 {
     value ^ (value >> 33)
 }
 
-#[cfg(windows)]
-fn monotonic_us() -> i64 {
-    #[repr(C)]
-    struct LargeInteger {
-        low: u32,
-        high: i32,
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn QueryPerformanceCounter(counter: *mut LargeInteger) -> i32;
-        fn QueryPerformanceFrequency(frequency: *mut LargeInteger) -> i32;
-    }
-
-    fn value(integer: LargeInteger) -> u64 {
-        ((integer.high as u32 as u64) << 32) | integer.low as u64
-    }
-
-    static FREQUENCY: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-        let mut frequency = LargeInteger { low: 0, high: 0 };
-        // SAFETY: the pointer is live and writable; the call only writes through it.
-        let status = unsafe { QueryPerformanceFrequency(&mut frequency) };
-        assert_ne!(status, 0, "the performance counter frequency is unavailable");
-        value(frequency)
-    });
-    let mut counter = LargeInteger { low: 0, high: 0 };
-    // SAFETY: same as above. `QueryPerformanceCounter` is monotonic from boot.
-    let status = unsafe { QueryPerformanceCounter(&mut counter) };
-    assert_ne!(status, 0, "the performance counter is unavailable");
-    (value(counter) as u128 * 1_000_000 / *FREQUENCY as u128) as i64
-}
-
-#[cfg(not(windows))]
+#[cfg(unix)]
 fn monotonic_us() -> i64 {
     let mut time = libc::timespec {
         tv_sec: 0,
@@ -198,6 +167,23 @@ fn monotonic_us() -> i64 {
     let status = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
     assert_eq!(status, 0, "CLOCK_MONOTONIC is unavailable");
     time.tv_sec * 1_000_000 + time.tv_nsec / 1000
+}
+
+#[cfg(windows)]
+fn monotonic_us() -> i64 {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+
+    let (mut count, mut frequency) = (0, 0);
+    // SAFETY: both pointers are to live, writable, aligned `i64`s, which the calls only write
+    // through. Neither call fails on Windows XP or later.
+    unsafe {
+        QueryPerformanceCounter(&mut count);
+        QueryPerformanceFrequency(&mut frequency);
+    }
+    // As `base::TimeTicks` converts it, without overflowing at high frequencies.
+    (i128::from(count) * 1_000_000 / i128::from(frequency)) as i64
 }
 
 #[cfg(test)]

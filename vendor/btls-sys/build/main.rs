@@ -228,6 +228,22 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
         }
     }
 
+    // BoringSSL's CMakeLists.txt makes CMake prefer cl whenever it builds for Windows,
+    // and on a Windows host cmake-rs names no compiler for a GNU target, so a MinGW
+    // build there would get cl. Name the compilers cc resolves for the target, as
+    // cmake-rs does on other hosts. (cfsolve patch)
+    if config.target_os == "windows"
+        && config.target_env == "gnu"
+        && config.host.contains("windows")
+        && !config.features.fips
+    {
+        let cc = cc::Build::new().get_compiler();
+        let cxx = cc::Build::new().cpp(true).get_compiler();
+        boringssl_cmake
+            .define("CMAKE_C_COMPILER", cc.path())
+            .define("CMAKE_CXX_COMPILER", cxx.path());
+    }
+
     if config.host == config.target {
         return boringssl_cmake;
     }
@@ -433,16 +449,6 @@ fn get_extra_clang_args_for_bindgen(config: &Config) -> Vec<String> {
                 }
             }
         }
-        // Native Windows builds use a mingw-w64 toolchain; libclang must be told where the
-        // target's C headers live. `MINGW_INCLUDE` lists them, separated by `;`.
-        "windows" if std::env::var_os("MINGW_INCLUDE").is_some() => {
-            let include = std::env::var("MINGW_INCLUDE").unwrap();
-            params.push("--target=x86_64-w64-mingw32".to_string());
-            for dir in include.split(';').filter(|dir| !dir.is_empty()) {
-                params.push("-isystem".to_string());
-                params.push(dir.to_string());
-            }
-        }
         _ => {}
     }
 
@@ -603,6 +609,10 @@ fn get_cpp_runtime_lib(config: &Config) -> Option<String> {
 
     match &*config.target_os {
         "macos" | "ios" | "freebsd" | "openbsd" | "android" => Some("c++".into()),
+        // MinGW's C++ runtime is not part of Windows, so link it in rather than
+        // need libstdc++-6.dll beside the executable. Unbundled, the linker finds
+        // it on its own search path. (cfsolve patch)
+        "windows" if config.target_env == "gnu" => Some("static:-bundle=stdc++".into()),
         _ if config.unix || config.target_env == "gnu" => Some("stdc++".into()),
         // TODO(rmehra): figure out how to do this for windows
         _ => None,
