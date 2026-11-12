@@ -124,7 +124,7 @@ async fn mint(sitekey: &str, url: &str, proxy: Option<String>) -> Result<String,
         page: PageSource::Blank,
         widget: Some(Widget { sitekey: sitekey.to_string(), action: None, cdata: None }),
     };
-    let options = Options { proxy, sink: None };
+    let options = Options { proxy, trusted_root: None, sink: None };
     b.solve_turnstile(t, &options).await.map_err(|e| e.to_string())
 }
 
@@ -246,7 +246,7 @@ async fn handle_solve(body: &[u8]) -> (u16, String) {
             cdata: req.cdata,
         }),
     };
-    let options = Options { proxy: req.proxy, sink: None };
+    let options = Options { proxy: req.proxy, trusted_root: None, sink: None };
     match b.solve_turnstile(t, &options).await {
         Ok(token) => {
             SOLVED.fetch_add(1, Ordering::Relaxed);
