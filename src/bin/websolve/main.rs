@@ -299,15 +299,36 @@ async fn serve_conn(stream: tokio::net::TcpStream) {
     let mut reader = BufReader::new(stream);
     let mut head = Vec::with_capacity(1024);
     let mut buf = [0u8; 4096];
+    // Read until the header terminator AND the announced body have fully arrived.
+    // TCP may deliver the request in segments; breaking on the terminator alone
+    // races the remaining headers/body (seen with the 2026-11-13 upstream port).
+    let mut content_length: usize = 0;
+    let mut header_end: Option<usize> = None;
     loop {
-        match reader.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => {
-                head.extend_from_slice(&buf[..n]);
-                if head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() > 64 * 1024 {
-                    break;
+        if header_end.is_none() {
+            if let Some(pos) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&head[..pos]).to_string();
+                for l in headers.split("\r\n").skip(1) {
+                    if let Some((k, v)) = l.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                        && let Ok(n) = v.trim().parse()
+                    {
+                        content_length = n;
+                    }
                 }
+                header_end = Some(pos + 4);
             }
+        }
+        if let Some(end) = header_end {
+            if head.len() - end >= content_length || head.len() > 64 * 1024 {
+                break;
+            }
+        } else if head.len() > 64 * 1024 {
+            break;
+        }
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
         }
     }
     let head_str = String::from_utf8_lossy(&head);
@@ -316,7 +337,6 @@ async fn serve_conn(stream: tokio::net::TcpStream) {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
-    let mut content_length = 0usize;
     for l in lines {
         if let Some((k, v)) = l.split_once(':') {
             if k.trim().eq_ignore_ascii_case("content-length") {
@@ -324,7 +344,7 @@ async fn serve_conn(stream: tokio::net::TcpStream) {
             }
         }
     }
-    let header_end = head_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(head_str.len());
+    let header_end = header_end.unwrap_or(head.len());
     let mut body: Vec<u8> = head[header_end..].to_vec();
     if body.len() > content_length {
         body.truncate(content_length);
